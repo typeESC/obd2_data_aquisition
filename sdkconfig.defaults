@@ -1,0 +1,2 @@
+# Seleciona o esquema de partição "Single factory app, SPIFFS"
+CONFIG_PARTITION_TABLE_SINGLE_APP_SPIFFS=y
