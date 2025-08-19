@@ -1,256 +1,535 @@
+/**
+ * @file main.c
+ * @brief Enhanced OBD-II Data Logger with FastAPI Integration
+ * @author Mario Venere Neto
+ * @date 2025
+ * 
+ * Features:
+ * - Real-time OBD-II data acquisition via CAN bus
+ * - WiFi connectivity with auto-reconnect
+ * - HTTP API integration with batch processing
+ * - Fallback mode for offline operation
+ * - Comprehensive error handling and logging
+ * - Performance optimized for ESP32
+ */
+
 #include <stdio.h>
 #include <string.h>
-#include <stdint.h>
-#include <sys/stat.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
+#include "freertos/timers.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
-#include "driver/twai.h"
-#include "esp_spiffs.h"
-#include "esp_http_server.h"
-#include "esp_netif.h"
-#include "esp_timer.h" // Adicionado para esp_log_timestamp
 
-// --- DEFINES E GLOBAIS ---
-#define WIFI_SSID      "S20_Estevan" // <-- Lembre-se de alterar
-#define WIFI_PASSWORD  "123456789" // <-- Lembre-se de alterar
-#define TAG "OBD_LOGGER"
+// Local includes
+#include "obd_config.h"
+#include "obd_can.h"
+#include "obd_parser.h"
+#include "api_client.h"
+#include "wifi_manager.h"
 
-const gpio_num_t CAN_RX_PIN = GPIO_NUM_27;
-const gpio_num_t CAN_TX_PIN = GPIO_NUM_25;
+static const char *TAG = "OBD_MAIN";
 
-static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
-static int s_retry_num = 0;
-char ip_address_str[16] = "0.0.0.0";
+// Global state variables
+static telemetry_batch_t current_batch = {0};
+static SemaphoreHandle_t batch_mutex = NULL;
+static TimerHandle_t batch_timer = NULL;
+static TaskHandle_t obd_task_handle = NULL;
+static TaskHandle_t api_task_handle = NULL;
+static bool system_running = false;
 
-// --- ATUALIZADO: Novo cabeçalho do CSV com a lista de PIDs refinada ---
-const char* CSV_HEADER = "Timestamp,RPM,Velocidade,TempAgua,CargaMotor,AvancoIgnicao,TempArAdmissao,MAF,PosAcelerador,TempoMotorLigado,DistCodApagados,NivelCombustivel,TensaoModulo,LambdaComandado,PosRelAcelerador,PercEtanol,TempOleo,TaxaCombustivel";
+// Statistics
+static struct {
+    uint32_t total_readings;
+    uint32_t successful_readings;
+    uint32_t failed_readings;
+    uint32_t api_sends;
+    uint32_t api_failures;
+    uint64_t start_time;
+    uint64_t last_stats_print;
+} stats = {0};
 
-// --- ATUALIZADO: Estrutura de dados para a nova lista de PIDs ---
-typedef struct {
-    float engine_load;
-    int coolant_temp;
-    float rpm;
-    int speed;
-    float timing_advance;
-    int intake_air_temp;
-    float maf_rate;
-    float throttle_pos;
-    int run_time;
-    int dist_since_clear;
-    float fuel_level;
-    float module_voltage;
-    float commanded_lambda;
-    float relative_throttle;
-    float ethanol_percentage;
-    int oil_temp;
-    float fuel_rate;
-} TelemetryData;
+// OBD PIDs to scan (in order of priority)
+static const obd_pid_t obd_scan_pids[] = {
+    PID_RPM,                    // Most critical
+    PID_SPEED,
+    PID_COOLANT_TEMP,
+    PID_ENGINE_LOAD,
+    PID_THROTTLE_POS,
+    PID_MAF_RATE,
+    PID_TIMING_ADVANCE,
+    PID_INTAKE_AIR_TEMP,
+    PID_FUEL_LEVEL,
+    PID_MODULE_VOLTAGE,
+    PID_RUN_TIME,
+    PID_DIST_SINCE_CLEAR,
+    PID_COMMANDED_LAMBDA,
+    PID_RELATIVE_THROTTLE,
+    PID_ETHANOL_PERCENTAGE,
+    PID_OIL_TEMP,
+    PID_FUEL_RATE               // Least critical
+};
 
-// --- FUNÇÕES DE LÓGICA OBD-II ---
-bool queryOBD(uint8_t mode, uint8_t pid, twai_message_t *response_msg) {
-    twai_message_t request_msg = { .identifier = 0x7DF, .flags = TWAI_MSG_FLAG_NONE, .data_length_code = 8, .data = {0x02, mode, pid, 0x55, 0x55, 0x55, 0x55, 0x55}};
-    if (twai_transmit(&request_msg, pdMS_TO_TICKS(100)) != ESP_OK) return false;
-    uint32_t startTime = esp_log_timestamp();
-    while (esp_log_timestamp() - startTime < 300) {
-        if (twai_receive(response_msg, pdMS_TO_TICKS(20)) == ESP_OK) {
-            if (response_msg->identifier >= 0x7E8 && response_msg->identifier <= 0x7EF && response_msg->data[1] == (mode + 0x40) && response_msg->data[2] == pid) { return true; }
-        }
+/**
+ * @brief Add telemetry data to current batch
+ * @param telemetry Pointer to telemetry data to add
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t add_to_batch(const telemetry_data_t *telemetry)
+{
+    if (telemetry == NULL || !telemetry->valid) {
+        return ESP_ERR_INVALID_ARG;
     }
-    return false;
+
+    if (xSemaphoreTake(batch_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire batch mutex");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Initialize batch if empty
+    if (current_batch.count == 0) {
+        current_batch.first_timestamp = telemetry->device_timestamp;
+    }
+
+    // Add data to batch
+    memcpy(&current_batch.data[current_batch.count], telemetry, sizeof(telemetry_data_t));
+    current_batch.count++;
+
+    // Check if batch is full
+    if (current_batch.count >= BATCH_SIZE) {
+        current_batch.ready_to_send = true;
+        ESP_LOGI(TAG, "Batch full (%d records), ready to send", current_batch.count);
+    }
+
+    xSemaphoreGive(batch_mutex);
+    return ESP_OK;
 }
 
-// --- TAREFA DE LOGGING OBD-II ---
-void obd_logging_task(void *pvParameters) {
-    ESP_LOGI(TAG, "Iniciando tarefa de logging OBD.");
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK || twai_start() != ESP_OK) { ESP_LOGE(TAG, "Falha ao iniciar driver TWAI!"); vTaskDelete(NULL); return; }
-    
-    FILE* f = fopen("/spiffs/datalog.csv", "a");
-    if (f == NULL) { ESP_LOGE(TAG, "Falha ao abrir datalog.csv"); vTaskDelete(NULL); return; }
-    struct stat st;
-    if (stat("/spiffs/datalog.csv", &st) == 0 && st.st_size == 0) {
-        fprintf(f, "%s\n", CSV_HEADER);
+/**
+ * @brief Send current batch to API and reset
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t send_and_reset_batch(void)
+{
+    if (xSemaphoreTake(batch_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to acquire batch mutex for send");
+        return ESP_ERR_TIMEOUT;
     }
-    fclose(f); 
 
-    TelemetryData carData = {0};
-    uint8_t pids_to_query[] = {0x04, 0x05, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x1F, 0x31, 0x2F, 0x42, 0x44, 0x45, 0x52, 0x5C, 0x5E};
-    size_t num_pids = sizeof(pids_to_query) / sizeof(pids_to_query[0]);
-    twai_message_t response;
+    esp_err_t ret = ESP_OK;
 
-    while (1) {
-        for (int i = 0; i < num_pids; i++) {
-            uint8_t pid = pids_to_query[i];
-            if (queryOBD(0x01, pid, &response)) {
-                int byteA = response.data[3]; int byteB = response.data[4];
-                switch (pid) {
-                    case 0x04: carData.engine_load = (byteA * 100.0) / 255.0; break;
-                    case 0x05: carData.coolant_temp = byteA - 40; break;
-                    case 0x0C: carData.rpm = ((byteA * 256) + byteB) / 4.0; break;
-                    case 0x0D: carData.speed = byteA; break;
-                    case 0x0E: carData.timing_advance = (byteA / 2.0) - 64.0; break;
-                    case 0x0F: carData.intake_air_temp = byteA - 40; break;
-                    case 0x10: carData.maf_rate = ((byteA * 256) + byteB) / 100.0; break;
-                    case 0x11: carData.throttle_pos = (byteA * 100.0) / 255.0; break;
-                    case 0x1F: carData.run_time = (byteA * 256) + byteB; break;
-                    case 0x31: carData.dist_since_clear = (byteA * 256) + byteB; break;
-                    case 0x2F: carData.fuel_level = (byteA * 100.0) / 255.0; break;
-                    case 0x42: carData.module_voltage = ((byteA * 256) + byteB) / 1000.0; break;
-                    case 0x44: carData.commanded_lambda = ((byteA * 256) + byteB) / 32768.0; break;
-                    case 0x45: carData.relative_throttle = (byteA * 100.0) / 255.0; break;
-                    case 0x52: carData.ethanol_percentage = (byteA * 100.0) / 255.0; break;
-                    case 0x5C: carData.oil_temp = byteA - 40; break;
-                    case 0x5E: carData.fuel_rate = ((byteA * 256) + byteB) / 20.0; break;
+    if (current_batch.count > 0) {
+        PERF_START();
+        
+        // Send batch to API
+        ret = api_send_telemetry_batch(&current_batch);
+        if (ret == ESP_OK) {
+            stats.api_sends++;
+            ESP_LOGI(TAG, "Batch sent successfully (%d records)", current_batch.count);
+        } else {
+            stats.api_failures++;
+            ESP_LOGW(TAG, "Failed to send batch: %s", esp_err_to_name(ret));
+        }
+
+        PERF_END("Batch send operation");
+
+        // Reset batch regardless of send result
+        memset(&current_batch, 0, sizeof(telemetry_batch_t));
+    }
+
+    xSemaphoreGive(batch_mutex);
+    return ret;
+}
+
+/**
+ * @brief Timer callback for batch timeout
+ * @param xTimer Timer handle
+ */
+static void batch_timer_callback(TimerHandle_t xTimer)
+{
+    if (current_batch.count > 0) {
+        ESP_LOGI(TAG, "Batch timeout - sending partial batch (%d records)", current_batch.count);
+        send_and_reset_batch();
+    }
+}
+
+/**
+ * @brief OBD data acquisition task
+ * @param pvParameters Task parameters
+ */
+static void obd_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "OBD task started");
+    
+    telemetry_data_t telemetry;
+    uint8_t response_buffer[8];
+    size_t response_len;
+    int pid_index = 0;
+    uint64_t last_reading_time = 0;
+
+    while (system_running) {
+        // Check if we have enough heap memory
+        size_t free_heap = esp_get_free_heap_size();
+        if (free_heap < HEAP_MIN_FREE) {
+            ESP_LOGW(TAG, "Low heap memory: %d bytes", free_heap);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Check CAN interface health
+        if (!obd_can_is_ready()) {
+            ESP_LOGW(TAG, "CAN interface not ready, reinitializing...");
+            obd_can_deinit();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (obd_can_init() != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+        }
+
+        // Initialize telemetry structure
+        obd_init_telemetry(&telemetry);
+
+        // Request OBD data for current PID
+        obd_pid_t current_pid = obd_scan_pids[pid_index];
+        response_len = sizeof(response_buffer);
+        
+        esp_err_t ret = obd_can_request(current_pid, response_buffer, &response_len);
+        stats.total_readings++;
+
+        if (ret == ESP_OK) {
+            // Parse the response
+            if (obd_parse_response(current_pid, response_buffer, response_len, &telemetry)) {
+                stats.successful_readings++;
+                
+                // Validate telemetry data
+                if (obd_validate_telemetry(&telemetry)) {
+                    telemetry.valid = true;
+                    
+                    // Add to batch
+                    if (add_to_batch(&telemetry) == ESP_OK) {
+                        DEBUG_LOG("Added PID 0x%02X to batch", current_pid);
+                    }
+                    
+                    last_reading_time = esp_timer_get_time() / 1000;
+                } else {
+                    ESP_LOGW(TAG, "Telemetry validation failed for PID 0x%02X", current_pid);
+                    stats.failed_readings++;
+                }
+            } else {
+                ESP_LOGW(TAG, "Failed to parse response for PID 0x%02X", current_pid);
+                stats.failed_readings++;
+            }
+        } else {
+            stats.failed_readings++;
+            DEBUG_LOG("Failed to read PID 0x%02X: %s", current_pid, esp_err_to_name(ret));
+        }
+
+        // Move to next PID
+        pid_index = (pid_index + 1) % ARRAY_SIZE(obd_scan_pids);
+
+        // Send batch if ready
+        if (current_batch.ready_to_send) {
+            send_and_reset_batch();
+        }
+
+        // Delay between readings
+        vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_DELAY_MS));
+    }
+
+    ESP_LOGI(TAG, "OBD task ended");
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief API management task
+ * @param pvParameters Task parameters
+ */
+static void api_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "API task started");
+    
+    uint64_t last_health_check = 0;
+    const uint64_t health_check_interval = 60000; // 1 minute
+
+    while (system_running) {
+        uint64_t now = esp_timer_get_time() / 1000;
+
+        // Periodic health check
+        if (now - last_health_check > health_check_interval) {
+            if (wifi_is_connected()) {
+                esp_err_t ret = api_test_connection();
+                if (ret == ESP_OK) {
+                    DEBUG_LOG("API health check passed");
+                } else {
+                    ESP_LOGW(TAG, "API health check failed");
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
+            last_health_check = now;
         }
-        
-        if (carData.rpm > 0) {
-            f = fopen("/spiffs/datalog.csv", "a");
-            if(f != NULL) {
-                fprintf(f, "%lu,%.0f,%d,%d,%.1f,%.1f,%d,%.2f,%.1f,%d,%d,%.1f,%.2f,%.4f,%.1f,%.1f,%d,%.2f\n", 
-                    (unsigned long)esp_log_timestamp(), carData.rpm, carData.speed, carData.coolant_temp, carData.engine_load,
-                    carData.timing_advance, carData.intake_air_temp, carData.maf_rate, carData.throttle_pos,
-                    carData.run_time, carData.dist_since_clear, carData.fuel_level, carData.module_voltage,
-                    carData.commanded_lambda, carData.relative_throttle, carData.ethanol_percentage,
-                    carData.oil_temp, carData.fuel_rate);
-                fclose(f);
-                ESP_LOGI(TAG, "RPM: %.0f, Vel: %d km/h -> Snapshot gravado.", carData.rpm, carData.speed);
-            } else { 
-                ESP_LOGE(TAG, "Falha ao reabrir o datalog.csv"); 
+
+        // Monitor batch timer
+        if (current_batch.count > 0) {
+            uint64_t batch_age = now - current_batch.first_timestamp;
+            if (batch_age > BATCH_TIMEOUT_MS) {
+                ESP_LOGI(TAG, "Batch timeout exceeded, forcing send");
+                send_and_reset_batch();
             }
-        } else {
-            ESP_LOGI(TAG, "RPM: %.0f. Motor desligado, dados nao gravados.", carData.rpm);
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
-}
 
-// --- LÓGICA DO SERVIDOR WEB E INICIALIZAÇÃO ---
-static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < 5) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Tentando reconectar ao Wi-Fi...");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        // Check WiFi status and attempt reconnection if needed
+        const wifi_connection_t *wifi_status = wifi_get_status();
+        if (wifi_status->status == WIFI_STATUS_DISCONNECTED && 
+            wifi_status->auto_reconnect_enabled) {
+            ESP_LOGI(TAG, "Attempting WiFi reconnection...");
+            wifi_connect(WIFI_SSID, WIFI_PASSWORD);
         }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Endereco de IP obtido: " IPSTR, IP2STR(&event->ip_info.ip));
-        sprintf(ip_address_str, IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Check every 5 seconds
     }
+
+    ESP_LOGI(TAG, "API task ended");
+    vTaskDelete(NULL);
 }
 
-esp_err_t root_get_handler(httpd_req_t *req) {
-    char html_buffer[1024];
-    snprintf(html_buffer, sizeof(html_buffer), "<!DOCTYPE html><html><head><title>ESP32 OBD Logger</title><style>body{font-family:sans-serif;text-align:center;padding-top:50px;} button{padding:15px;font-size:16px;margin:10px;cursor:pointer;}</style></head><body><h1>ESP32 OBD-II Datalogger</h1><p>Dispositivo conectado com o IP: <strong>%s</strong></p><p>O dispositivo esta lendo os dados do seu carro e gravando em um arquivo CSV.</p><p><a href='/download'><button style='background-color:#4CAF50;color:white;'>Baixar datalog.csv</button></a><a href='/clear' onclick=\"return confirm('Tem certeza que deseja apagar todos os dados do log?');\"><button style='background-color:#f44336;color:white;'>Limpar Log</button></a></p></body></html>", ip_address_str);
-    httpd_resp_send(req, html_buffer, strlen(html_buffer));
-    return ESP_OK;
-}
+/**
+ * @brief Print system statistics
+ */
+static void print_statistics(void)
+{
+    uint64_t now = esp_timer_get_time() / 1000;
+    uint64_t uptime = (now - stats.start_time) / 1000; // Convert to seconds
+    
+    ESP_LOGI(TAG, "=== System Statistics ===");
+    ESP_LOGI(TAG, "Uptime: %llu seconds (%.1f minutes)", uptime, uptime / 60.0f);
+    ESP_LOGI(TAG, "Total OBD readings: %u", stats.total_readings);
+    ESP_LOGI(TAG, "Successful readings: %u (%.1f%%)", stats.successful_readings, 
+             stats.total_readings ? (stats.successful_readings * 100.0f / stats.total_readings) : 0);
+    ESP_LOGI(TAG, "Failed readings: %u (%.1f%%)", stats.failed_readings,
+             stats.total_readings ? (stats.failed_readings * 100.0f / stats.total_readings) : 0);
+    ESP_LOGI(TAG, "API sends: %u", stats.api_sends);
+    ESP_LOGI(TAG, "API failures: %u", stats.api_failures);
+    ESP_LOGI(TAG, "Current batch size: %d/%d", current_batch.count, BATCH_SIZE);
+    ESP_LOGI(TAG, "Free heap: %d bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Min free heap: %d bytes", esp_get_minimum_free_heap_size());
 
-esp_err_t clear_get_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "Recebida requisicao para limpar o arquivo de log.");
-    FILE* f = fopen("/spiffs/datalog.csv", "w");
-    if (f == NULL) { ESP_LOGE(TAG, "Falha ao abrir o arquivo para limpar."); httpd_resp_send_500(req); return ESP_FAIL; }
-    fprintf(f, "%s\n", CSV_HEADER);
-    fclose(f);
-    ESP_LOGI(TAG, "Arquivo de log limpo com sucesso.");
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
-}
-
-esp_err_t download_get_handler(httpd_req_t *req) {
-    char filepath[] = "/spiffs/datalog.csv";
-    FILE* f = fopen(filepath, "r");
-    if (f == NULL) { httpd_resp_send_404(req); return ESP_OK; }
-    httpd_resp_set_type(req, "text/csv");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"datalog.csv\"");
-    char buffer[256];
-    size_t bytes_read;
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), f)) > 0) {
-        httpd_resp_send_chunk(req, buffer, bytes_read);
+    // WiFi statistics
+    const wifi_connection_t *wifi_status = wifi_get_status();
+    if (wifi_is_connected()) {
+        char ip_str[16];
+        wifi_get_ip_string(ip_str, sizeof(ip_str));
+        ESP_LOGI(TAG, "WiFi: Connected to %s, IP: %s, RSSI: %d dBm", 
+                WIFI_SSID, ip_str, wifi_status->rssi);
+    } else {
+        ESP_LOGI(TAG, "WiFi: Disconnected (status: %d)", wifi_status->status);
     }
-    fclose(f);
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
+
+    // API status
+    const api_connection_t *api_status = api_get_connection_status();
+    ESP_LOGI(TAG, "API: Status %d, Consecutive failures: %d, Fallback: %s",
+             api_status->status, api_status->consecutive_failures,
+             api_status->fallback_active ? "YES" : "NO");
+
+    // CAN statistics
+    uint32_t tx_errors, rx_errors, arb_lost, bus_errors;
+    obd_can_get_stats(&tx_errors, &rx_errors, &arb_lost, &bus_errors);
+    ESP_LOGI(TAG, "CAN: TX errors: %u, RX errors: %u, Bus errors: %u",
+             tx_errors, rx_errors, bus_errors);
+    
+    ESP_LOGI(TAG, "========================");
+    
+    stats.last_stats_print = now;
 }
 
-httpd_handle_t start_webserver(void) {
-    httpd_handle_t server = NULL;
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t root_uri = {.uri = "/", .method = HTTP_GET, .handler = root_get_handler};
-        httpd_register_uri_handler(server, &root_uri);
-        httpd_uri_t download_uri = {.uri = "/download", .method = HTTP_GET, .handler = download_get_handler};
-        httpd_register_uri_handler(server, &download_uri);
-        httpd_uri_t clear_uri = {.uri = "/clear", .method = HTTP_GET, .handler = clear_get_handler};
-        httpd_register_uri_handler(server, &clear_uri);
-    }
-    return server;
-}
+/**
+ * @brief Initialize system components
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t system_init(void)
+{
+    esp_err_t ret = ESP_OK;
 
-void wifi_init_sta(void) {
-    s_wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
-    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASSWORD, }, };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "Conectando ao Wi-Fi: %s", WIFI_SSID);
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Conectado com sucesso!");
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "Falha ao conectar ao Wi-Fi.");
-    }
-}
+    ESP_LOGI(TAG, "Initializing OBD Data Logger System...");
 
-void spiffs_init(void) {
-    esp_vfs_spiffs_conf_t conf = { .base_path = "/spiffs", .partition_label = NULL, .max_files = 5, .format_if_mount_failed = true };
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar o SPIFFS (%s)", esp_err_to_name(ret));
-    }
-}
-
-void app_main(void) {
-    esp_err_t ret = nvs_flash_init();
+    // Initialize NVS
+    ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
+        ESP_LOGW(TAG, "NVS partition truncated, erasing...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    spiffs_init();
-    wifi_init_sta();
-    start_webserver();
-    xTaskCreate(obd_logging_task, "OBD Logging Task", 4096, NULL, 5, NULL);
+
+    // Create synchronization objects
+    batch_mutex = xSemaphoreCreateMutex();
+    if (batch_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create batch mutex");
+        return ESP_FAIL;
+    }
+
+    // Create batch timer
+    batch_timer = xTimerCreate("BatchTimer", 
+                              pdMS_TO_TICKS(BATCH_TIMEOUT_MS),
+                              pdTRUE,  // Auto-reload
+                              NULL,
+                              batch_timer_callback);
+    if (batch_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create batch timer");
+        return ESP_FAIL;
+    }
+
+    // Initialize WiFi
+    ret = wifi_manager_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize WiFi manager: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Initialize API client
+    ret = api_client_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize API client: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Initialize CAN interface
+    ret = obd_can_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize CAN interface: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Initialize statistics
+    stats.start_time = esp_timer_get_time() / 1000;
+    stats.last_stats_print = stats.start_time;
+
+    ESP_LOGI(TAG, "System initialization completed successfully");
+    return ESP_OK;
+}
+
+/**
+ * @brief Start system tasks
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t start_tasks(void)
+{
+    system_running = true;
+
+    // Start batch timer
+    if (xTimerStart(batch_timer, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start batch timer");
+        return ESP_FAIL;
+    }
+
+    // Create OBD task
+    BaseType_t ret = xTaskCreate(obd_task, "OBD_Task", TASK_STACK_SIZE, NULL, 
+                                TASK_PRIORITY + 1, &obd_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OBD task");
+        return ESP_FAIL;
+    }
+
+    // Create API task
+    ret = xTaskCreate(api_task, "API_Task", TASK_STACK_SIZE, NULL, 
+                     TASK_PRIORITY, &api_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create API task");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "All tasks started successfully");
+    return ESP_OK;
+}
+
+/**
+ * @brief Main application entry point
+ */
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting Enhanced OBD-II Data Logger v1.0");
+    ESP_LOGI(TAG, "Build date: %s %s", __DATE__, __TIME__);
+    ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
+
+    // Set log level
+    esp_log_level_set("*", LOG_LEVEL);
+
+    // Initialize system
+    if (system_init() != ESP_OK) {
+        ESP_LOGE(TAG, "System initialization failed, rebooting...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
+    // Connect to WiFi
+    ESP_LOGI(TAG, "Connecting to WiFi: %s", WIFI_SSID);
+    esp_err_t ret = wifi_connect(WIFI_SSID, WIFI_PASSWORD);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start WiFi connection: %s", esp_err_to_name(ret));
+    }
+
+    // Wait for WiFi connection (with timeout)
+    ret = wifi_wait_for_connection(30000); // 30 seconds timeout
+    if (ret == ESP_OK) {
+        char ip_str[16];
+        wifi_get_ip_string(ip_str, sizeof(ip_str));
+        ESP_LOGI(TAG, "WiFi connected successfully, IP: %s", ip_str);
+        
+        // Test API connection
+        ret = api_test_connection();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "API connection test successful");
+        } else {
+            ESP_LOGW(TAG, "API connection test failed, will retry later");
+        }
+    } else {
+        ESP_LOGW(TAG, "WiFi connection timeout, continuing without network");
+        api_set_fallback_mode(true);
+    }
+
+    // Start main tasks
+    if (start_tasks() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start tasks, rebooting...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
+    // Main monitoring loop
+    uint64_t last_stats_time = 0;
+    const uint64_t stats_interval = 60000; // Print stats every minute
+
+    while (true) {
+        uint64_t now = esp_timer_get_time() / 1000;
+
+        // Print periodic statistics
+        if (now - last_stats_time > stats_interval) {
+            print_statistics();
+            last_stats_time = now;
+        }
+
+        // Monitor system health
+        size_t free_heap = esp_get_free_heap_size();
+        if (free_heap < HEAP_MIN_FREE) {
+            ESP_LOGW(TAG, "Critical heap memory low: %d bytes", free_heap);
+            
+            // Try to free some memory by sending current batch
+            if (current_batch.count > 0) {
+                send_and_reset_batch();
+            }
+        }
+
+        // Check for stack overflow
+        UBaseType_t obd_stack_left = uxTaskGetStackHighWaterMark(obd_task_handle);
+        UBaseType_t api_stack_left = uxTaskGetStackHighWaterMark(api_task_handle);
+        
+        if (obd_stack_left < 1024 || api_stack_left < 1024) {
+            ESP_LOGW(TAG, "Low stack space - OBD: %u, API: %u", obd_stack_left, api_stack_left);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Main loop every 10 seconds
+    }
 }
