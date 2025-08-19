@@ -5,7 +5,7 @@ Core configuration settings for the OBD Data Logger API.
 from functools import lru_cache
 from typing import Optional, List
 
-from pydantic import PostgresDsn, validator, Field
+from pydantic import PostgresDsn, field_validator, Field
 from pydantic_settings import BaseSettings
 
 
@@ -37,21 +37,11 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = Field(default="obd_password")
     POSTGRES_DB: str = Field(default="obd_logger")
     POSTGRES_PORT: int = Field(default=5432)
-    DATABASE_URL: Optional[PostgresDsn] = None
 
-    @validator("DATABASE_URL", pre=True)
-    @classmethod
-    def assemble_db_connection(cls, v: Optional[str], values: dict) -> str:
-        if isinstance(v, str):
-            return v
-        return PostgresDsn.build(
-            scheme="postgresql+asyncpg",
-            username=values.get("POSTGRES_USER"),
-            password=values.get("POSTGRES_PASSWORD"),
-            host=values.get("POSTGRES_SERVER"),
-            port=values.get("POSTGRES_PORT"),
-            path=f"/{values.get('POSTGRES_DB') or ''}",
-        )
+    @property
+    def DATABASE_URL(self) -> str:
+        """Construct database URL from individual components."""
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
     # Redis (for caching and rate limiting)
     REDIS_URL: str = Field(default="redis://localhost:6379/0")

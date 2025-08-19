@@ -165,7 +165,7 @@ class VehicleAlertBase(BaseSchema):
     """Base vehicle alert schema."""
 
     alert_type: str = Field(..., max_length=50)
-    severity: str = Field(..., regex="^(low|medium|high|critical)$")
+    severity: str = Field(..., pattern="^(low|medium|high|critical)$")
     message: str
     parameter_name: Optional[str] = Field(None, max_length=50)
     parameter_value: Optional[float] = None
