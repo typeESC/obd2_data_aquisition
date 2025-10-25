@@ -130,7 +130,7 @@ esp_err_t obd_can_request(uint8_t pid, uint8_t *response, size_t *response_len)
     // Prepare OBD request message
     tx_msg.identifier = OBD_REQUEST_ID;
     tx_msg.data_length_code = 8;
-    tx_msg.data[0] = 2;                    // Number of additional bytes
+    tx_msg.data[0] = 0x02;                    // Number of additional bytes
     tx_msg.data[1] = OBD_MODE_CURRENT;     // Mode 01 - current data
     tx_msg.data[2] = pid;                  // PID to request
     tx_msg.data[3] = 0xCC;                 // Padding

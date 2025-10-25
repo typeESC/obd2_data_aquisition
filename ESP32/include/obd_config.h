@@ -19,7 +19,7 @@
 #define WIFI_RETRY_DELAY    5000                    // Delay between retries (ms)
 
 // === API CONFIGURATION ===
-#define API_BASE_URL        "http://192.168.1.7:8000/api/v1"  // Configure your computer IP to function as API server
+#define API_BASE_URL        "http://10.221.24.112/api/v1"  // Configure your computer IP to function as API server
 #define API_SESSION_ID      "550e8400-e29b-41d4-a716-446655440001"  // Configure session ID
 #define API_VEHICLE_ID      "550e8400-e29b-41d4-a716-446655440000"  // Configure vehicle ID
 #define API_TIMEOUT_MS      10000                   // HTTP request timeout
@@ -34,7 +34,7 @@
 // === OBD CONFIGURATION ===
 #define CAN_RX_PIN          GPIO_NUM_27             // CAN RX pin
 #define CAN_TX_PIN          GPIO_NUM_25             // CAN TX pin
-#define OBD_QUERY_DELAY_MS  10                      // Delay between OBD queries
+#define OBD_QUERY_DELAY_MS  50                      // Delay between OBD queries
 #define OBD_SCAN_INTERVAL   150                     // Main scan loop interval (ms)
 #define OBD_RESPONSE_TIMEOUT 300                    // OBD response timeout (ms)
 
@@ -50,7 +50,7 @@
 
 // === PERFORMANCE TUNING ===
 #define HTTP_BUFFER_SIZE    4096                    // HTTP buffer size
-#define JSON_BUFFER_SIZE    2048                    // JSON buffer size
+#define JSON_BUFFER_SIZE    12288                    // JSON buffer size
 #define SPIFFS_MAX_FILES    5                       // Maximum SPIFFS files
 #define HEAP_MIN_FREE       50000                   // Minimum free heap (bytes)
 
