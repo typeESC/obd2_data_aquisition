@@ -1,7 +1,6 @@
 /**
  * @file api_client.c
  * @brief HTTP API client implementation for sending telemetry data
- * @author Mario Venere Neto
  * @date 2025
  */
 

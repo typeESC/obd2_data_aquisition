@@ -34,9 +34,9 @@
 // TODO: Adjust pins according to your ESP32 wiring
 #define CAN_RX_PIN          GPIO_NUM_27
 #define CAN_TX_PIN          GPIO_NUM_25
-#define OBD_QUERY_DELAY_MS  10          // Recommended: 5-20ms
-#define OBD_SCAN_INTERVAL   150         // Main scan loop interval
-#define OBD_RESPONSE_TIMEOUT 300        // OBD response timeout
+#define OBD_QUERY_DELAY_MS  50          // Recommended: 5-20ms
+#define OBD_SCAN_INTERVAL   500         // Main scan loop interval
+#define OBD_RESPONSE_TIMEOUT 500        // OBD response timeout
 
 // === LOGGING CONFIGURATION ===
 #define LOG_TAG             "OBD_LOGGER"

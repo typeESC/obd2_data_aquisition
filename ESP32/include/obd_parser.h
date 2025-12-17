@@ -1,7 +1,6 @@
 /**
  * @file obd_parser.h
  * @brief OBD-II data parsing utilities
- * @author Mario Venere Neto
  * @date 2025
  */
 
@@ -42,36 +41,16 @@ void obd_init_telemetry(telemetry_data_t *telemetry);
 void obd_log_telemetry(const telemetry_data_t *telemetry);
 
 /**
- * @brief Convert temperature from Celsius to Fahrenheit
- * @param celsius Temperature in Celsius
- * @return Temperature in Fahrenheit
- */
-static inline float celsius_to_fahrenheit(int celsius)
-{
-    return (celsius * 9.0f / 5.0f) + 32.0f;
-}
-
-/**
- * @brief Convert speed from km/h to mph
- * @param kmh Speed in km/h
- * @return Speed in mph
- */
-static inline float kmh_to_mph(int kmh)
-{
-    return kmh * 0.621371f;
-}
-
-/**
  * @brief Convert fuel consumption from L/h to mpg (rough estimation)
  * @param lph Fuel consumption in L/h
  * @param speed Current speed in km/h
  * @return Rough MPG estimation
  */
-static inline float lph_to_mpg(float lph, int speed)
+static inline float lph(float kmh, int speed)
 {
-    if (lph <= 0 || speed <= 0) return 0;
-    float kmpl = speed / lph;
-    return kmpl * 2.352f;  // Convert km/L to MPG
+    if (kmh <= 0 || speed <= 0) return 0;
+    float kmpl = speed / kmh;
+    return kmpl;  // Convert km/L to MPG
 }
 
 #endif // OBD_PARSER_H

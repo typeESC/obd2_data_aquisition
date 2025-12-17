@@ -1,7 +1,6 @@
 /**
  * @file api_client.h
  * @brief HTTP API client for sending telemetry data to FastAPI backend
- * @author Mario Venere Neto
  * @date 2025
  */
 

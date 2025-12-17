@@ -1,7 +1,6 @@
 /**
  * @file obd_can.h
  * @brief CAN communication interface for OBD-II
- * @author Mario Venere Neto
  * @date 2025
  */
 

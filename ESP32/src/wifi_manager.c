@@ -1,7 +1,6 @@
 /**
  * @file wifi_manager.c
  * @brief WiFi connection management implementation
- * @author Mario Venere Neto
  * @date 2025
  */
 

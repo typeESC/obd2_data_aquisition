@@ -1,7 +1,6 @@
 /**
  * @file obd_config.h
  * @brief Configuration header for OBD Data Logger with API integration
- * @author Mario Venere Neto
  * @date 2025
  */
 
@@ -13,13 +12,13 @@
 #include "esp_timer.h"
 
 // === NETWORK CONFIGURATION ===
-#define WIFI_SSID           "D08D_Fibra"        // Configure your WiFi SSID
-#define WIFI_PASSWORD       "4Dh2RqV5"    // Configure your WiFi password
+#define WIFI_SSID           "VIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
+#define WIFI_PASSWORD       "Mara@2025"    // Configure your WiFi password
 #define WIFI_MAX_RETRY      5                       // Maximum WiFi connection retries
 #define WIFI_RETRY_DELAY    5000                    // Delay between retries (ms)
 
 // === API CONFIGURATION ===
-#define API_BASE_URL        "http://10.221.24.112/api/v1"  // Configure your computer IP to function as API server
+#define API_BASE_URL        "http://192.168.15.29/api/v1"  // Configure your computer IP to function as API server
 #define API_SESSION_ID      "550e8400-e29b-41d4-a716-446655440001"  // Configure session ID
 #define API_VEHICLE_ID      "550e8400-e29b-41d4-a716-446655440000"  // Configure vehicle ID
 #define API_TIMEOUT_MS      10000                   // HTTP request timeout
@@ -34,9 +33,16 @@
 // === OBD CONFIGURATION ===
 #define CAN_RX_PIN          GPIO_NUM_27             // CAN RX pin
 #define CAN_TX_PIN          GPIO_NUM_25             // CAN TX pin
-#define OBD_QUERY_DELAY_MS  50                      // Delay between OBD queries
-#define OBD_SCAN_INTERVAL   150                     // Main scan loop interval (ms)
-#define OBD_RESPONSE_TIMEOUT 300                    // OBD response timeout (ms)
+#define OBD_QUERY_DELAY_MS  50                      // MUDE: 100 → 50
+#define OBD_SCAN_INTERVAL   500                     // OK (mantém)
+#define OBD_RESPONSE_TIMEOUT 10                     // MUDE: 500 → 20 (CRÍTICO!)
+#define OBD_MAX_WAIT_TIME   40                     // ADICIONE esta linha
+#define OBD_STRICT_VALIDATION false                 // OK (mantém)
+
+// === MULTI-RATE TASK CONFIGURATION ===
+#define CRITICAL_TASK_DELAY_MS 50           // 50ms = 20 Hz
+#define HIGH_TASK_DELAY_MS 200              // 100ms = 10 Hz
+#define LOW_TASK_DELAY_MS 2000              // 2000ms = 0.5 Hz
 
 // === LOGGING CONFIGURATION ===
 #define LOG_TAG             "OBD_LOGGER"
@@ -139,11 +145,9 @@ typedef struct {
 #if ENABLE_DEBUG_LOGS
 #define DEBUG_LOG(fmt, ...)   ESP_LOGD(LOG_TAG, fmt, ##__VA_ARGS__)
 
-// RENOMEADO para evitar conflito com a macro PERF_START da biblioteca LwIP
 #define OBD_PERF_START() \
     int64_t _perf_start_time = esp_timer_get_time()
 
-// RENOMEADO para ser consistente
 #define OBD_PERF_END(name) do { \
     int64_t _perf_duration_us = esp_timer_get_time() - _perf_start_time; \
     ESP_LOGD(LOG_TAG, "PERF: '%s' took %lld us (%.2f ms)", \

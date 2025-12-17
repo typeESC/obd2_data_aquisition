@@ -1,7 +1,6 @@
 /**
  * @file main.c
  * @brief Enhanced OBD-II Data Logger with FastAPI Integration
- * @author Mario Venere Neto
  * @date 2025
  * 
  * Features:
@@ -43,6 +42,8 @@ static TimerHandle_t batch_timer = NULL;
 static TaskHandle_t obd_task_handle = NULL;
 static TaskHandle_t api_task_handle = NULL;
 static bool system_running = false;
+static telemetry_data_t g_current_telemetry; // O "snapshot" mestre
+static SemaphoreHandle_t g_telemetry_mutex = NULL; // Proteção para o snapshot
 
 // Statistics
 static struct {
@@ -55,25 +56,35 @@ static struct {
     uint64_t last_stats_print;
 } stats = {0};
 
-// OBD PIDs to scan (in order of priority)
-static const obd_pid_t obd_scan_pids[] = {
-    PID_RPM,                    // Most critical
+// === PID ARRAYS POR PRIORIDADE ===
+
+// PIDs CRÍTICOS - 50ms (20 Hz)
+static const obd_pid_t critical_pids[] = {
+    PID_RPM,
+    PID_THROTTLE_POS
+};
+
+// PIDs ALTA PRIORIDADE - 100ms (10 Hz)
+static const obd_pid_t high_priority_pids[] = {
     PID_SPEED,
-    PID_COOLANT_TEMP,
     PID_ENGINE_LOAD,
-    PID_THROTTLE_POS,
     PID_MAF_RATE,
     PID_TIMING_ADVANCE,
-    PID_INTAKE_AIR_TEMP,
-    PID_FUEL_LEVEL,
     PID_MODULE_VOLTAGE,
+    PID_FUEL_LEVEL,
+    PID_RELATIVE_THROTTLE
+};
+
+// PIDs BAIXA PRIORIDADE - 2000ms (0.5 Hz)
+static const obd_pid_t low_priority_pids[] = {
+    PID_COOLANT_TEMP,
+    PID_INTAKE_AIR_TEMP,
+    PID_OIL_TEMP,
     PID_RUN_TIME,
     PID_DIST_SINCE_CLEAR,
     PID_COMMANDED_LAMBDA,
-    PID_RELATIVE_THROTTLE,
     PID_ETHANOL_PERCENTAGE,
-    PID_OIL_TEMP,
-    PID_FUEL_RATE               // Least critical
+    PID_FUEL_RATE
 };
 
 /**
@@ -163,25 +174,19 @@ static void batch_timer_callback(TimerHandle_t xTimer)
  * @brief OBD data acquisition task
  * @param pvParameters Task parameters
  */
-static void obd_task(void *pvParameters)
+static void obd_critical_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "OBD task started");
+    ESP_LOGI(TAG, "Critical OBD task started (100ms / 10 Hz)");
     
-    telemetry_data_t telemetry;
     uint8_t response_buffer[8];
     size_t response_len;
     int pid_index = 0;
+    uint64_t last_stats_time = 0;
+    uint32_t readings_in_second = 0;
+    TickType_t last_wake_time = xTaskGetTickCount();
 
     while (system_running) {
-        // Check if we have enough heap memory
-        size_t free_heap = esp_get_free_heap_size();
-        if (free_heap < HEAP_MIN_FREE) {
-            ESP_LOGW(TAG, "Low heap memory: %d bytes", free_heap);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
-        // Check CAN interface health
+        // ... (checagens de heap e CAN) ...
         if (!obd_can_is_ready()) {
             ESP_LOGW(TAG, "CAN interface not ready, reinitializing...");
             obd_can_deinit();
@@ -192,56 +197,170 @@ static void obd_task(void *pvParameters)
             }
         }
 
-        // Initialize telemetry structure
-        obd_init_telemetry(&telemetry);
-
-        // Request OBD data for current PID
-        obd_pid_t current_pid = obd_scan_pids[pid_index];
+        // 1. LÊ SEUS PIDS CRÍTICOS
+        obd_pid_t current_pid = critical_pids[pid_index];
         response_len = sizeof(response_buffer);
         
         esp_err_t ret = obd_can_request(current_pid, response_buffer, &response_len);
         stats.total_readings++;
 
         if (ret == ESP_OK) {
-            // Parse the response
-            if (obd_parse_response(current_pid, response_buffer, response_len, &telemetry)) {
-                stats.successful_readings++;
+            // 2. TRAVA O MUTEX E ATUALIZA O SNAPSHOT MESTRE
+            if (xSemaphoreTake(g_telemetry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 
-                // Validate telemetry data
-                if (obd_validate_telemetry(&telemetry)) {
-                    telemetry.valid = true;
-                    
-                    // Add to batch
-                    if (add_to_batch(&telemetry) == ESP_OK) {
-                        DEBUG_LOG("Added PID 0x%02X to batch", current_pid);
-                    }
-                    
+                if (obd_parse_response(current_pid, response_buffer, response_len, &g_current_telemetry)) {
+                    stats.successful_readings++;
+                    readings_in_second++;
+                    DEBUG_LOG("Critical: PID 0x%02X updated", current_pid);
                 } else {
-                    ESP_LOGW(TAG, "Telemetry validation failed for PID 0x%02X", current_pid);
                     stats.failed_readings++;
                 }
+                
+                xSemaphoreGive(g_telemetry_mutex);
             } else {
-                ESP_LOGW(TAG, "Failed to parse response for PID 0x%02X", current_pid);
+                ESP_LOGW(TAG, "Critical task couldn't get telemetry mutex!");
                 stats.failed_readings++;
             }
         } else {
             stats.failed_readings++;
-            DEBUG_LOG("Failed to read PID 0x%02X: %s", current_pid, esp_err_to_name(ret));
         }
 
-        // Move to next PID
-        pid_index = (pid_index + 1) % ARRAY_SIZE(obd_scan_pids);
+        // Move para o próximo PID crítico
+        pid_index = (pid_index + 1) % ARRAY_SIZE(critical_pids);
 
-        // Send batch if ready
-        if (current_batch.ready_to_send) {
-            send_and_reset_batch();
+        // 3. ADICIONA O SNAPSHOT COMPLETO AO BATCH (A CADA 100ms)
+        // Só faz isso se estivermos no último PID do ciclo, para enviar 1 snapshot/ciclo
+        if (pid_index == 0) {
+            if (xSemaphoreTake(g_telemetry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                
+                g_current_telemetry.valid = true; // Marca o snapshot como válido
+                add_to_batch(&g_current_telemetry);
+                
+                xSemaphoreGive(g_telemetry_mutex);
+            }
+
+            // Esta tarefa agora serve como "zelador" para enviar o batch quando ele encher.
+            if (current_batch.ready_to_send) {
+                ESP_LOGI(TAG, "Batch está cheio, Low task iniciando envio...");
+                send_and_reset_batch();
+            }
         }
 
-        // Delay between readings
-        vTaskDelay(pdMS_TO_TICKS(OBD_QUERY_DELAY_MS));
+        // Estatísticas a cada segundo
+        uint64_t now = esp_timer_get_time() / 1000;
+        if (now - last_stats_time >= 1000) {
+            ESP_LOGI(TAG, "Critical task: %lu readings/s", readings_in_second);
+            readings_in_second = 0;
+            last_stats_time = now;
+        }
+
+        // Delay preciso para 10 Hz
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(CRITICAL_TASK_DELAY_MS));
     }
 
-    ESP_LOGI(TAG, "OBD task ended");
+    ESP_LOGI(TAG, "Critical OBD task ended");
+    vTaskDelete(NULL);
+}
+/**
+ * @brief High priority OBD task - Apenas atualiza o snapshot
+ */
+static void obd_high_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "High priority OBD task started (200ms / 5 Hz)");
+    
+    uint8_t response_buffer[8];
+    size_t response_len;
+    int pid_index = 0;
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    while (system_running) {
+        if (!obd_can_is_ready()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        
+        obd_pid_t current_pid = high_priority_pids[pid_index];
+        response_len = sizeof(response_buffer);
+        
+        esp_err_t ret = obd_can_request(current_pid, response_buffer, &response_len);
+        stats.total_readings++;
+
+        if (ret == ESP_OK) {
+            // Trava o mutex para atualizar o snapshot global
+            if (xSemaphoreTake(g_telemetry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                
+                if (obd_parse_response(current_pid, response_buffer, response_len, &g_current_telemetry)) {
+                    stats.successful_readings++;
+                    DEBUG_LOG("High: PID 0x%02X updated", current_pid);
+                } else {
+                    stats.failed_readings++;
+                }
+                
+                xSemaphoreGive(g_telemetry_mutex);
+            } else {
+                ESP_LOGW(TAG, "High task couldn't get telemetry mutex!");
+                stats.failed_readings++;
+            }
+        } else {
+            stats.failed_readings++;
+        }
+
+        pid_index = (pid_index + 1) % ARRAY_SIZE(high_priority_pids);
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(HIGH_TASK_DELAY_MS));
+    }
+
+    ESP_LOGI(TAG, "High priority OBD task ended");
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Low priority OBD task - Apenas atualiza o snapshot e gerencia o envio
+ */
+static void obd_low_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Low priority OBD task started (2000ms / 0.5 Hz)");
+    
+    uint8_t response_buffer[8];
+    size_t response_len;
+    int pid_index = 0;
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    while (system_running) {
+        // ... (checagem de heap) ...
+        
+        obd_pid_t current_pid = low_priority_pids[pid_index];
+        response_len = sizeof(response_buffer);
+        
+        esp_err_t ret = obd_can_request(current_pid, response_buffer, &response_len);
+        stats.total_readings++;
+        
+        if (ret == ESP_OK) {
+            // Trava o mutex para atualizar o snapshot global
+            if (xSemaphoreTake(g_telemetry_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                
+                if (obd_parse_response(current_pid, response_buffer, response_len, &g_current_telemetry)) {
+                    stats.successful_readings++;
+                    DEBUG_LOG("Low: PID 0x%02X updated", current_pid);
+                } else {
+                    stats.failed_readings++;
+                }
+                
+                xSemaphoreGive(g_telemetry_mutex);
+            } else {
+                ESP_LOGW(TAG, "Low task couldn't get telemetry mutex!");
+                stats.failed_readings++;
+            }
+        } else {
+            stats.failed_readings++;
+        }
+
+        pid_index = (pid_index + 1) % ARRAY_SIZE(low_priority_pids);
+    
+
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(LOW_TASK_DELAY_MS));
+    }
+
+    ESP_LOGI(TAG, "Low priority OBD task ended");
     vTaskDelete(NULL);
 }
 
@@ -342,7 +461,21 @@ static void print_statistics(void)
     
     ESP_LOGI(TAG, "========================");
     
+    ESP_LOGI(TAG, "--- Current Telemetry Snapshot ---");
+    if (xSemaphoreTake(g_telemetry_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        obd_log_telemetry(&g_current_telemetry);
+        xSemaphoreGive(g_telemetry_mutex);
+    } else {
+        ESP_LOGW(TAG, "Failed to get telemetry mutex to log stats.");
+    }
+
     stats.last_stats_print = now;
+
+    if (arb_lost > 100) {
+    ESP_LOGW(TAG, "⚠️  HIGH CAN ARBITRATION LOST: %lu (bus overloaded!)", arb_lost);
+    }
+
+    ESP_LOGI(TAG, "CAN Arbitration lost: %lu/min", arb_lost);
 }
 
 /**
@@ -419,29 +552,50 @@ static esp_err_t start_tasks(void)
 {
     system_running = true;
 
-    // Start batch timer
     if (xTimerStart(batch_timer, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start batch timer");
         return ESP_FAIL;
     }
 
-    // Create OBD task
-    BaseType_t ret = xTaskCreate(obd_task, "OBD_Task", TASK_STACK_SIZE, NULL, 
-                                TASK_PRIORITY + 1, &obd_task_handle);
+    // ✅ Create CRITICAL task (50ms)
+    TaskHandle_t critical_task_handle;
+    BaseType_t ret = xTaskCreate(obd_critical_task, "OBD_Critical", TASK_STACK_SIZE, NULL, 
+                                TASK_PRIORITY + 3, &critical_task_handle);
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create OBD task");
+        ESP_LOGE(TAG, "Failed to create critical OBD task");
+        return ESP_FAIL;
+    }
+
+    // ✅ Create HIGH task (100ms)
+    TaskHandle_t high_task_handle;
+    ret = xTaskCreate(obd_high_task, "OBD_High", TASK_STACK_SIZE, NULL, 
+                     TASK_PRIORITY + 2, &high_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create high priority OBD task");
+        return ESP_FAIL;
+    }
+
+    // ✅ Create LOW task (2000ms)
+    ret = xTaskCreate(obd_low_task, "OBD_Low", TASK_STACK_SIZE, NULL, 
+                     TASK_PRIORITY, &obd_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create low priority OBD task");
         return ESP_FAIL;
     }
 
     // Create API task
     ret = xTaskCreate(api_task, "API_Task", TASK_STACK_SIZE, NULL, 
-                     TASK_PRIORITY, &api_task_handle);
+                     TASK_PRIORITY - 1, &api_task_handle);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create API task");
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "All tasks started successfully");
+    ESP_LOGI(TAG, "  - Critical: 2 PIDs @ 20 Hz (50ms)");
+    ESP_LOGI(TAG, "  - High:     7 PIDs @ 10 Hz (100ms)");
+    ESP_LOGI(TAG, "  - Low:      8 PIDs @ 0.5 Hz (2s)");
+    
     return ESP_OK;
 }
 

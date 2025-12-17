@@ -1,7 +1,6 @@
 /**
  * @file obd_parser.c
  * @brief OBD-II data parsing implementation
- * @author Mario Venere Neto
  * @date 2025
  */
 
@@ -251,11 +250,11 @@ void obd_log_telemetry(const telemetry_data_t *telemetry)
     ESP_LOGI(TAG, "=== Telemetry Data ===");
     ESP_LOGI(TAG, "Timestamp: %llu ms", telemetry->device_timestamp);
     ESP_LOGI(TAG, "RPM: %.1f", telemetry->rpm);
-    ESP_LOGI(TAG, "Speed: %d km/h (%.1f mph)", telemetry->speed, kmh_to_mph(telemetry->speed));
-    ESP_LOGI(TAG, "Coolant Temp: %d°C (%.1f°F)", telemetry->coolant_temp, celsius_to_fahrenheit(telemetry->coolant_temp));
+    ESP_LOGI(TAG, "Speed: %d km/h (%.1f mph)", telemetry->speed);
+    ESP_LOGI(TAG, "Coolant Temp: %d°C (%.1f°F)", telemetry->coolant_temp);
     ESP_LOGI(TAG, "Engine Load: %.1f%%", telemetry->engine_load);
     ESP_LOGI(TAG, "Timing Advance: %.1f°", telemetry->timing_advance);
-    ESP_LOGI(TAG, "Intake Air Temp: %d°C (%.1f°F)", telemetry->intake_air_temp, celsius_to_fahrenheit(telemetry->intake_air_temp));
+    ESP_LOGI(TAG, "Intake Air Temp: %d°C (%.1f°F)", telemetry->intake_air_temp);
     ESP_LOGI(TAG, "MAF Rate: %.2f g/s", telemetry->maf_rate);
     ESP_LOGI(TAG, "Throttle Position: %.1f%%", telemetry->throttle_pos);
     ESP_LOGI(TAG, "Runtime: %d s", telemetry->run_time);
@@ -265,11 +264,11 @@ void obd_log_telemetry(const telemetry_data_t *telemetry)
     ESP_LOGI(TAG, "Commanded Lambda: %.3f", telemetry->commanded_lambda);
     ESP_LOGI(TAG, "Relative Throttle: %.1f%%", telemetry->relative_throttle);
     ESP_LOGI(TAG, "Ethanol Percentage: %.1f%%", telemetry->ethanol_percentage);
-    ESP_LOGI(TAG, "Oil Temp: %d°C (%.1f°F)", telemetry->oil_temp, celsius_to_fahrenheit(telemetry->oil_temp));
+    ESP_LOGI(TAG, "Oil Temp: %d°C (%.1f°F)", telemetry->oil_temp);
     ESP_LOGI(TAG, "Fuel Rate: %.2f L/h", telemetry->fuel_rate);
     
     if (telemetry->speed > 0 && telemetry->fuel_rate > 0) {
-        ESP_LOGI(TAG, "Estimated MPG: %.1f", lph_to_mpg(telemetry->fuel_rate, telemetry->speed));
+        ESP_LOGI(TAG, "Estimated MPG: %.1f", lph(telemetry->fuel_rate, telemetry->speed));
     }
     
     ESP_LOGI(TAG, "Valid: %s", telemetry->valid ? "YES" : "NO");
