@@ -244,8 +244,8 @@ esp_err_t api_send_telemetry_single(const telemetry_data_t *telemetry)
     }
 
     // Set URL for single record endpoint
-    char single_url[256];
-    snprintf(single_url, sizeof(single_url), "%s/telemetry", API_BASE_URL);
+    char single_url[512];
+    snprintf(single_url, sizeof(single_url), "%s/telemetry/records?session_id=%s&vehicle_id=%s", API_BASE_URL, API_SESSION_ID, API_VEHICLE_ID);
     esp_http_client_set_url(http_client, single_url);
     esp_http_client_set_post_field(http_client, json_data, strlen(json_data));
 
@@ -347,8 +347,6 @@ esp_err_t api_telemetry_to_json(const telemetry_data_t *telemetry, char *json_bu
     }
 
     // Add required fields
-    cJSON_AddStringToObject(json, "session_id", API_SESSION_ID);
-    cJSON_AddStringToObject(json, "vehicle_id", API_VEHICLE_ID);
     cJSON_AddNumberToObject(json, "device_timestamp", telemetry->device_timestamp);
 
     // Add telemetry data

@@ -307,7 +307,7 @@ esp_err_t obd_can_request(uint8_t pid, uint8_t *response, size_t *response_len)
     ret = twai_transmit(&tx_msg, pdMS_TO_TICKS(100));
     if (ret != ESP_OK) {
         tx_error_count++;
-        ESP_LOGE(TAG, "✗ Falha ao enviar requisição: %s", esp_err_to_name(ret));
+        //ESP_LOGE(TAG, "✗ Falha ao enviar requisição: %s", esp_err_to_name(ret));
         goto cleanup;
     }
     
@@ -386,7 +386,7 @@ esp_err_t obd_can_request(uint8_t pid, uint8_t *response, size_t *response_len)
     if (!found_response) {
         timeout_count++;
         rx_error_count++;
-        ESP_LOGE(TAG, "  ✗ NENHUMA RESPOSTA VÁLIDA ENCONTRADA");
+        //ESP_LOGE(TAG, "  ✗ NENHUMA RESPOSTA VÁLIDA ENCONTRADA");
         ret = ESP_ERR_NOT_FOUND;
     }
 

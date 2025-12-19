@@ -12,13 +12,13 @@
 #include "esp_timer.h"
 
 // === NETWORK CONFIGURATION ===
-#define WIFI_SSID           "VIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
+#define WIFI_SSID           "AVIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
 #define WIFI_PASSWORD       "Mara@2025"    // Configure your WiFi password
 #define WIFI_MAX_RETRY      5                       // Maximum WiFi connection retries
 #define WIFI_RETRY_DELAY    5000                    // Delay between retries (ms)
 
 // === API CONFIGURATION ===
-#define API_BASE_URL        "http://192.168.15.29/api/v1"  // Configure your computer IP to function as API server
+#define API_BASE_URL        "http://192.168.15.29:8000/api/v1"  // Configure your computer IP to function as API server
 #define API_SESSION_ID      "550e8400-e29b-41d4-a716-446655440001"  // Configure session ID
 #define API_VEHICLE_ID      "550e8400-e29b-41d4-a716-446655440000"  // Configure vehicle ID
 #define API_TIMEOUT_MS      10000                   // HTTP request timeout
