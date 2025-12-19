@@ -69,4 +69,41 @@ void obd_can_get_stats(uint32_t *tx_errors, uint32_t *rx_errors, uint32_t *arb_l
  */
 void obd_can_reset_stats(void);
 
+// === CAN MODE CONFIGURATION ===
+typedef enum {
+    CAN_MODE_OBD_ONLY,      // Filter accepts only OBD responses (0x7E8-0x7EF)
+    CAN_MODE_SNIFF_ONLY,    // Accept all CAN IDs, listen-only mode
+    CAN_MODE_HYBRID         // Accept all CAN IDs, normal mode (TX enabled)
+} can_filter_mode_t;
+
+/**
+ * @brief Reconfigure CAN interface for different operation modes
+ * @param mode The desired filter mode
+ * @return ESP_OK on success, error code on failure
+ * 
+ * NOTE: This will restart the TWAI driver with new configuration.
+ * Any pending messages will be lost.
+ */
+esp_err_t obd_can_set_mode(can_filter_mode_t mode);
+
+/**
+ * @brief Get current CAN filter mode
+ * @return Current can_filter_mode_t
+ */
+can_filter_mode_t obd_can_get_mode(void);
+
+/**
+ * @brief Get mutex handle for CAN access synchronization
+ * @return SemaphoreHandle_t or NULL if not initialized
+ */
+SemaphoreHandle_t obd_can_get_mutex(void);
+
+/**
+ * @brief Receive a raw CAN message (for sniffing)
+ * @param msg Pointer to message structure to fill
+ * @param timeout_ms Timeout in milliseconds
+ * @return ESP_OK if message received, ESP_ERR_TIMEOUT on timeout
+ */
+esp_err_t obd_can_receive_raw(twai_message_t *msg, uint32_t timeout_ms);
+
 #endif // OBD_CAN_H

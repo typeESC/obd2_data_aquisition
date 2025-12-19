@@ -5,6 +5,8 @@
 
 #include "web_server.h"
 #include "data_logger.h"
+#include "can_sniffer.h"
+#include "obd_can.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include <stdio.h>
@@ -22,8 +24,11 @@ static char device_ip_display[16] = "0.0.0.0";
 static int current_state = 0;
 static uint32_t current_records = 0;
 
-// Nomes dos estados para exibição
-static const char *STATE_NAMES[] = {"INIT", "IGN_OFF", "IGN_ON", "LOGGING", "ERROR"};
+// Nomes dos estados para exibição (incluindo estados de sniffing)
+static const char *STATE_NAMES[] = {
+    "INIT", "IGN_OFF", "IGN_ON", "LOGGING", "ERROR",
+    "SNIFF", "SNIFF_LOW", "HYBRID"
+};
 
 /**
  * @brief Handler: Página principal com lista de arquivos
@@ -116,6 +121,29 @@ static esp_err_t root_handler(httpd_req_t *req) {
                 "<p style='margin-top:20px;color:#666'><b>Total:</b> %d files, %.2f KB</p>",
                 file_count, total_size / 1024.0);
         }
+    }
+    
+    // Card de Sniffing CAN
+    sniff_state_t sniff_state = can_sniffer_get_state();
+    sniff_stats_t sniff_stats;
+    can_sniffer_get_stats(&sniff_stats);
+    
+    len += snprintf(html + len, 16384 - len,
+        "</div><div class='card'><h3>🔍 CAN Sniffer</h3>"
+        "<p>Estado: <b style='color:%s'>%s</b></p>"
+        "<p>Mensagens capturadas: <b>%lu</b> | IDs únicos: <b>%lu</b></p>",
+        sniff_state == SNIFF_STATE_ACTIVE ? "#4CAF50" : 
+        sniff_state == SNIFF_STATE_STORAGE_LOW ? "#ff9800" : "#666",
+        can_sniffer_state_name(sniff_state),
+        sniff_stats.messages_captured,
+        sniff_stats.unique_ids);
+    
+    if (sniff_state == SNIFF_STATE_IDLE) {
+        len += snprintf(html + len, 16384 - len,
+            "<a href='/api/sniff/start' class='btn green'>▶️ Iniciar Sniffing</a>");
+    } else if (sniff_state == SNIFF_STATE_ACTIVE || sniff_state == SNIFF_STATE_STORAGE_LOW) {
+        len += snprintf(html + len, 16384 - len,
+            "<a href='/api/sniff/stop' class='btn red'>⏹️ Parar Sniffing</a>");
     }
     
     // Botões de ação
@@ -283,6 +311,125 @@ static esp_err_t download_all_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ============================================================================
+// SNIFFER API HANDLERS
+// ============================================================================
+
+/**
+ * @brief Handler: Start CAN sniffing
+ * GET /api/sniff/start?exclude_obd=1&id_min=0x000&id_max=0x7FF
+ */
+static esp_err_t sniff_start_handler(httpd_req_t *req) {
+    sniff_filter_t filter = {
+        .id_min = 0x000,
+        .id_max = 0x7FF,
+        .exclude_obd_requests = true,
+        .exclude_obd_responses = false
+    };
+    
+    // Parse query parameters
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        char *buf = malloc(buf_len);
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            char param[32];
+            if (httpd_query_key_value(buf, "exclude_obd", param, sizeof(param)) == ESP_OK) {
+                filter.exclude_obd_responses = (atoi(param) == 1);
+            }
+            if (httpd_query_key_value(buf, "id_min", param, sizeof(param)) == ESP_OK) {
+                filter.id_min = strtol(param, NULL, 0);
+            }
+            if (httpd_query_key_value(buf, "id_max", param, sizeof(param)) == ESP_OK) {
+                filter.id_max = strtol(param, NULL, 0);
+            }
+        }
+        free(buf);
+    }
+    
+    // Switch CAN to hybrid mode if not already
+    if (obd_can_get_mode() == CAN_MODE_OBD_ONLY) {
+        obd_can_set_mode(CAN_MODE_HYBRID);
+    }
+    
+    // Start sniffer
+    esp_err_t ret = can_sniffer_start(&filter);
+    
+    // Redirect back to main page for better UX
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Sniffer started via web API");
+    }
+    
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Handler: Stop CAN sniffing
+ * GET /api/sniff/stop
+ */
+static esp_err_t sniff_stop_handler(httpd_req_t *req) {
+    (void)can_sniffer_stop();  // Ignore return value
+    
+    // Return to OBD-only mode
+    obd_can_set_mode(CAN_MODE_OBD_ONLY);
+    
+    ESP_LOGI(TAG, "Sniffer stopped via web API");
+    
+    // Redirect back to main page
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Handler: Get sniffer status
+ * GET /api/sniff/status
+ */
+static esp_err_t sniff_status_handler(httpd_req_t *req) {
+    sniff_stats_t stats;
+    can_sniffer_get_stats(&stats);
+    sniff_state_t state = can_sniffer_get_state();
+    
+    char log_path[64] = "";
+    can_sniffer_get_log_path(log_path, sizeof(log_path));
+    
+    httpd_resp_set_type(req, "application/json");
+    
+    char response[768];
+    snprintf(response, sizeof(response),
+             "{"
+             "\"state\":\"%s\","
+             "\"can_mode\":\"%s\","
+             "\"messages_captured\":%lu,"
+             "\"messages_logged\":%lu,"
+             "\"unique_ids\":%lu,"
+             "\"bytes_written\":%u,"
+             "\"buffer_overflows\":%lu,"
+             "\"storage_free_kb\":%.1f,"
+             "\"storage_percent_used\":%.1f,"
+             "\"current_file\":\"%s\""
+             "}",
+             can_sniffer_state_name(state),
+             obd_can_get_mode() == CAN_MODE_OBD_ONLY ? "OBD_ONLY" :
+             obd_can_get_mode() == CAN_MODE_SNIFF_ONLY ? "SNIFF_ONLY" : "HYBRID",
+             stats.messages_captured,
+             stats.messages_logged,
+             stats.unique_ids,
+             (unsigned)stats.bytes_written,
+             stats.buffer_overflows,
+             stats.storage_free / 1024.0f,
+             stats.storage_percent_used,
+             log_path);
+    
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
 esp_err_t web_server_start(const char *device_ip) {
     if (device_ip) {
         strncpy(device_ip_display, device_ip, sizeof(device_ip_display) - 1);
@@ -290,7 +437,7 @@ esp_err_t web_server_start(const char *device_ip) {
     
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 16384;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 16;  // Increased for sniffer endpoints
     config.lru_purge_enable = true;
     
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -298,20 +445,28 @@ esp_err_t web_server_start(const char *device_ip) {
         return ESP_FAIL;
     }
     
-    // Registra handlers
+    // Registra handlers - páginas principais
     httpd_uri_t root = {.uri = "/", .method = HTTP_GET, .handler = root_handler};
     httpd_uri_t download = {.uri = "/download", .method = HTTP_GET, .handler = download_handler};
     httpd_uri_t delete_file = {.uri = "/delete", .method = HTTP_GET, .handler = delete_file_handler};
     httpd_uri_t delete_all = {.uri = "/delete-all", .method = HTTP_GET, .handler = delete_all_handler};
     httpd_uri_t download_all = {.uri = "/download-all", .method = HTTP_GET, .handler = download_all_handler};
     
+    // Registra handlers - API de sniffing
+    httpd_uri_t sniff_start = {.uri = "/api/sniff/start", .method = HTTP_GET, .handler = sniff_start_handler};
+    httpd_uri_t sniff_stop = {.uri = "/api/sniff/stop", .method = HTTP_GET, .handler = sniff_stop_handler};
+    httpd_uri_t sniff_status = {.uri = "/api/sniff/status", .method = HTTP_GET, .handler = sniff_status_handler};
+    
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &download);
     httpd_register_uri_handler(server, &delete_file);
     httpd_register_uri_handler(server, &delete_all);
     httpd_register_uri_handler(server, &download_all);
+    httpd_register_uri_handler(server, &sniff_start);
+    httpd_register_uri_handler(server, &sniff_stop);
+    httpd_register_uri_handler(server, &sniff_status);
     
-    ESP_LOGI(TAG, "Web server started");
+    ESP_LOGI(TAG, "Web server started with sniffer API");
     return ESP_OK;
 }
 

@@ -1,122 +1,249 @@
-# Enhanced ESP32 OBD-II Data Logger
+# Smart ESP32 OBD-II Logger v2.0
 
-A high-performance ESP32-based OBD-II data logger with FastAPI backend integration, featuring real-time telemetry acquisition, WiFi connectivity, and robust error handling.
+A comprehensive ESP32-based OBD-II data logger with CAN bus sniffing capabilities, featuring automatic ignition detection, hybrid mode operation, web interface, and SPIFFS storage.
 
 ## Features
 
-- **Real-time OBD-II Data Acquisition**: Comprehensive telemetry data collection via CAN bus
-- **FastAPI Integration**: HTTP client with batch processing and fallback mode
-- **WiFi Management**: Auto-reconnect and connection monitoring
-- **Performance Optimized**: Memory management, error handling, and stack monitoring
-- **Comprehensive Logging**: Structured logging with performance metrics
-- **Batch Processing**: Efficient data transmission with configurable batching
+- **Automatic Ignition Detection**: Auto-start/stop logging based on RPM and voltage
+- **Dual-Mode Operation**: 
+  - OBD-II mode for standard diagnostics
+  - CAN Sniffer mode for reverse engineering
+  - Hybrid mode (OBD + Sniffing simultaneously)
+- **Web Interface**: Real-time monitoring and control via HTTP server
+- **Local Storage**: SPIFFS-based CSV logging (SavvyCAN-compatible GVRET format)
+- **LED Status Indicators**: Visual feedback without display
+- **WiFi Connectivity**: Web dashboard and future cloud integration
+- **Offline Operation**: Works without internet connection
 
 ## Hardware Requirements
 
-- ESP32 development board
-- CAN transceiver (e.g., SN65HVD230)
-- OBD-II connector
-- 12V to 3.3V/5V power supply
+- **ESP32 DevKit V1** (ESP32-D0WD-V3)
+- **CAN Transceiver**: MCP2515 or SN65HVD230
+- **OBD-II Connector**: 16-pin male connector
+- **Power**: 12V from OBD port → 3.3V/5V for ESP32
+- **Optional**: External antenna for better WiFi range
 
-## Wiring Diagram
+## Pin Configuration
 
 ```
-ESP32          CAN Transceiver    OBD-II Connector
-GPIO 25 (TX) → CTX                
-GPIO 27 (RX) ← CRX                
-GND          → GND               Pin 5 (Signal Ground)
-VCC (3.3V)   → VCC               
-             → CANH              Pin 6 (CAN High)
-             → CANL              Pin 14 (CAN Low)
+ESP32 GPIO     Function              OBD-II Pin
+-------------------------------------------------
+GPIO 25        CAN TX                Via Transceiver
+GPIO 27        CAN RX                Via Transceiver
+GPIO 2         Status LED            Internal LED
+GND            Ground                Pin 4, 5 (Ground)
+VIN            12V Power             Pin 16 (12V Battery)
+
+CAN Bus:
+  Pin 6  → CANH (CAN High)
+  Pin 14 → CANL (CAN Low)
 ```
 
 ## Configuration
 
 ### 1. WiFi Configuration
-Edit `main/obd_config.h`:
+Edit `include/obd_config.h`:
 ```c
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
 ```
 
-### 2. API Configuration
-Configure your FastAPI backend:
-```c
-#define API_BASE_URL        "http://192.168.1.100:8000/api/v1"
-#define API_SESSION_ID      "550e8400-e29b-41d4-a716-446655440001"
-#define API_VEHICLE_ID      "550e8400-e29b-41d4-a716-446655440000"
-```
-
-### 3. CAN Bus Configuration
-Adjust pin assignments if needed:
+### 2. CAN Bus Configuration (Already configured)
 ```c
 #define CAN_RX_PIN          GPIO_NUM_27
 #define CAN_TX_PIN          GPIO_NUM_25
+#define CAN_BITRATE         500000  // 500 kbps (standard OBD)
 ```
 
-### 4. Performance Tuning
-Modify batch and timing settings:
+### 3. Ignition Detection Thresholds
 ```c
-#define BATCH_SIZE          10      // Records per batch
-#define BATCH_TIMEOUT_MS    30000   // Batch timeout
-#define OBD_QUERY_DELAY_MS  10      // Delay between OBD queries
+#define IGNITION_RPM_THRESHOLD      300     // RPM > 300 = ON
+#define IGNITION_VOLTAGE_THRESHOLD  12.5f   // Volts > 12.5 = ON
+#define IGNITION_OFF_TIMEOUT        5000    // 5s timeout
 ```
+
+### 4. Storage Configuration
+- **SPIFFS Partition**: ~2MB for session logs
+- **Auto-cleanup**: When storage reaches 80%
+- **File format**: 
+  - OBD logs: `session_YYYY-MM-DD_HH-MM.csv`
+  - CAN logs: `canlog_YYYYMMDD_HHMMSS.csv` (GVRET format)
 
 ## Build Instructions
 
 ### Prerequisites
 - ESP-IDF v4.4 or later
 - FastAPI backend running (see backend documentation)
+**PlatformIO** or **ESP-IDF v5.5**
+- **Python 3.7+** (for analysis script)
+- **SavvyCAN** (optional, for CAN log analysis)
 
-### Build and Flash
+### Using PlatformIO (Recommended)
 ```bash
-# Set up ESP-IDF environment
-. $HOME/esp/esp-idf/export.sh
+# Build
+platformio run
 
-# Configure the project
-idf.py menuconfig
-
-# Build the project
-idf.py build
-
-# Flash to ESP32
-idf.py -p /dev/ttyUSB0 flash
+# Upload
+platformio run --target upload
 
 # Monitor serial output
-idf.py -p /dev/ttyUSB0 monitor
+platformio run --target monitor
+
+# Upload + Monitor
+platformio run --target upload --target monitor
 ```
 
-## System Architecture
+### Using ESP-IDF
+```bash
+# Set up environment
+. $HOME/esp/esp-idf/export.sh
+src/obd_can.c`, `include/obd_can.h`)
+   - TWAI driver for CAN communication
+   - Multi-mode operation (OBD/Sniff/Hybrid)
+   - Thread-safe with mutex protection
+   - 500 kbps bitrate
 
-### Main Components
+2. **OBD Parser** (`src/obd_parser.c`, `include/obd_parser.h`)
+   - Parses 17+ OBD PIDs
+   - Data validation and unit conversion
+   - Telemetry structure management
 
-1. **OBD CAN Interface** (`obd_can.c`/`obd_can.h`)
-   - CAN bus communication
-   - OBD-II protocol handling
-   - Error detection and recovery
+3. **CAN Sniffer** (`src/can_sniffer.c`, `include/can_sniffer.h`)
+   - Circular buffer (200 messages)
+   - GVRET CSV format (SavvyCAN compatible)
+   - Configurable filters (ID range, exclude OBD)
+   - Statistics tracking
 
-2. **Data Parser** (`obd_parser.c`/`obd_parser.h`)
-   - OBD response parsing
-   - Data validation
-   - Unit conversions
+4. **Storage Manager** (`src/storage_manager.c`, `include/storage_manager.h`)
+   - SPIFFS abstraction layer
+   - Auto-cleanup when storage low
+   - Prepared for SD card expansion
 
-3. **API Client** (`api_client.c`/`api_client.h`)
-   - HTTP communication
-   - JSON serialization
-   - Batch processing
-   - Fallback mode
+5. **WiFi Manager** (`src/wifi_manager.c`, `include/wifi_manager.h`)
+   - Auto-connect with retry logic
+   - mDNS support (obd2logger.local)
+   - Connection monitoring
 
-4. **WiFi Manager** (`wifi_manager.c`/`wifi_manager.h`)
-   - WiFi connection management
-   - Auto-reconnect
-   - Signal monitoring
+6. **Web Server** (`src/web_server.c`, `include/web_server.h`)
+   - Real-time dashboard
+   - REST API for sniffer control
+   - Session file download
+   - Status updates via SSE (future)
 
-5. **Main Application** (`main.c`)
-   - Task coordination
-   - System monitoring
-   - Statistics reporting
+7. **Data Logger** (`src/data_logger.c`, `include/data_logger.h`)
+   - CSV session management
+   - Auto-start/stop based on ignition
+   - Timestamp synchronization via NTP
 
-### Task Structure
+8. **Main Application** (`src/main.c`)
+   - State machine with 8 states
+   Features in Detail
+
+### 1. Automatic Ignition Detection
+Sistema detecta automaticamente quando o carro liga/desliga através de:
+- **RPM > 300**: Motor rodando
+- **Voltagem > 12.5V**: Bateria carregando (alternador)
+- **Timeout de 5s**: Sem sinais = carro desligou
+
+### 2. LED Status Patterns
+
+| Pattern | Meaning | Duration |
+|---------|---------|----------|
+| Slow blink (2s ON, 0.5s OFF) | Ignition OFF | Continuous |
+| Quick pulse (50ms ON, 1950ms OFF) | Ignition ON | Continuous |
+| Medium blink (500ms/500ms) | OBD Logging | Continuous |
+| Fast blink (100ms/100ms) | Sniffing Active | Continuous |
+| 3 quick + pause | Storage Low Warning | Repeating |
+| 2 blinks + pause | Hybrid Mode | Repeating |
+
+### 3. Web Dashboard
+
+Access at: `http://obd2logger.local/` or `http://<ESP32_IP>/`
+
+**Features:**
+- Real-time telemetry display
+- System state indicator
+- Session statistics
+- File download links
+- Sniffer controls (Start/Stop/Status)
+
+**API Endpoints:**
+```
+GET  /                      → Dashboard HTML
+GET  /api/telemetry         → Current telemetry JSON
+GET  /api/sessions          → List of session files
+GET  /download/<filename>   → Download CSV file
+POST /api/sniff/start       → Start CAN sniffer
+POST /api/sniff/stop        → Stop CAN sniffer
+GET  /api/sniff/status      → Sniffer status JSON
+```
+
+### 4. CAN Sniffer Features
+
+- **GVRET Format**: Compatible with SavvyCAN
+- **Configurable Filters**: ID range and OBD exclusion
+- **Circular Buffer**: 200 messages (never loses data)
+- **Statistics**: Messages captured, unique IDs, overflows
+- **Storage Protection**: Stops at 80% capacity
+
+**Example GVRET Output:**
+```csv
+Time Stamp,ID,Extended,Dir,Bus,LEN,D1,D2,D3,D4,D5,D6,D7,D8
+152463421,0x123,false,Rx,0,8,01,02,03,04,05,06,07,08
+```
+
+### 5. Python Analysis Tool
+
+`tools/can_analyzer.py` - Reverse engineering helper
+
+```bash
+python tools/can_analyzer.py canlog_20251219_165447.csv --rpm-range 800 3500
+```
+
+**Features:**
+- Find RPM candidates (8-bit and 16-bit)
+- Find speed candidates
+- Frequency analysis
+- Correlation detection
+
+## Monitored OBD Parameters
+
+| PID | Parameter | Unit | Range |
+|-----|-----------|------|-------|
+| 0x0C | Engine RPM | RPM | 0-8000 |
+| 0x0D | Vehicle Speed | km/h | 0-255 |
+| 0x05 | Coolant Temp | °C | -40-215 |
+| 0x04 | Engine Load | % | 0-100 |
+| 0x11 | Throttle Position | % | 0-100 |
+| 0x10 | MAF Rate | g/s | 0-655 | → Car off, standby mode
+STATE_IGNITION_ON    → Car on, ready to log
+STATE_LOGGING        → Actively logging OBD data
+STATE_ERROR          → Error state, attempting recovery
+STATE_SNIFF_ACTIVE   → CAN sniffing active
+STATE_SNIFF_STORAGE_LOW → Sniffing with low storage warning
+STATE_HYBRID_MODE    → OBD + Sniffing simultaneously
+```
+
+### Data Flow
+
+#### OBD Mode
+```
+Vehicle ECU → CAN Bus → TWAI → OBD Parser → CSV File (SPIFFS)
+                                    ↓
+                              Web Dashboard
+```
+
+#### Sniffer Mode
+```
+CAN Bus → TWAI (Promiscuous) → Circular Buffer → GVRET CSV → SPIFFS
+                                                       ↓
+                                                  SavvyCAN
+```
+
+#### Hybrid Mode
+```
+CAN Bus → ┬→ OBD Task (Filters 0x7E8) → OBD CSV
+          └→ Sniffer Task (All IDs)    → CAN CSV
 
 - **OBD Task**: High-priority data acquisition
 - **API Task**: Network communication and health checks

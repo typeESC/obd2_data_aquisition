@@ -17,6 +17,7 @@
 static const char *TAG = "OBD_CAN";
 static bool can_initialized = false;
 static SemaphoreHandle_t can_mutex = NULL;
+static can_filter_mode_t current_mode = CAN_MODE_OBD_ONLY;
 
 // ============================================================================
 // CONTADORES DE ESTATÍSTICAS (expandidos para melhor debug)
@@ -471,4 +472,121 @@ void obd_can_reset_stats(void)
     }
     
     ESP_LOGI(TAG, "✓ Estatísticas resetadas");
+}
+
+// ============================================================================
+// CAN MODE RECONFIGURATION FOR SNIFFING
+// ============================================================================
+
+esp_err_t obd_can_set_mode(can_filter_mode_t mode)
+{
+    ESP_LOGI(TAG, "Reconfigurando CAN para modo: %d", mode);
+    
+    // Se já está no modo desejado, não faz nada
+    if (can_initialized && current_mode == mode) {
+        ESP_LOGI(TAG, "Já está no modo solicitado");
+        return ESP_OK;
+    }
+    
+    // Para o driver se estiver rodando
+    if (can_initialized) {
+        if (xSemaphoreTake(can_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            twai_stop();
+            twai_driver_uninstall();
+            can_initialized = false;
+            xSemaphoreGive(can_mutex);
+        } else {
+            ESP_LOGE(TAG, "Falha ao adquirir mutex para reconfiguração");
+            return ESP_FAIL;
+        }
+    }
+    
+    // Configuração de timing: 500 kbps
+    twai_timing_config_t timing_config = CAN_TIMING_CONFIG_500KBITS();
+    
+    // Configuração de filtro baseada no modo
+    twai_filter_config_t filter_config;
+    twai_mode_t twai_mode;
+    
+    switch (mode) {
+        case CAN_MODE_OBD_ONLY:
+            // Filtro restritivo: apenas respostas OBD (0x7E8-0x7EF)
+            filter_config.acceptance_code = (uint32_t)(0x7E8 << 21);
+            filter_config.acceptance_mask = (uint32_t)(~(0x7 << 21));
+            filter_config.single_filter = true;
+            twai_mode = TWAI_MODE_NORMAL;
+            ESP_LOGI(TAG, "  Modo: OBD_ONLY (filtro 0x7E8-0x7EF)");
+            break;
+            
+        case CAN_MODE_SNIFF_ONLY:
+            // Aceita todos os IDs, modo listen-only (não transmite)
+            filter_config = (twai_filter_config_t)TWAI_FILTER_CONFIG_ACCEPT_ALL();
+            twai_mode = TWAI_MODE_LISTEN_ONLY;
+            ESP_LOGI(TAG, "  Modo: SNIFF_ONLY (accept all, listen-only)");
+            break;
+            
+        case CAN_MODE_HYBRID:
+            // Aceita todos os IDs, modo normal (pode transmitir)
+            filter_config = (twai_filter_config_t)TWAI_FILTER_CONFIG_ACCEPT_ALL();
+            twai_mode = TWAI_MODE_NORMAL;
+            ESP_LOGI(TAG, "  Modo: HYBRID (accept all, TX enabled)");
+            break;
+            
+        default:
+            ESP_LOGE(TAG, "Modo inválido: %d", mode);
+            return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Configuração geral
+    twai_general_config_t general_config = CAN_GENERAL_CONFIG_DEFAULT(
+        CAN_TX_PIN, CAN_RX_PIN, twai_mode);
+    
+    // Aumenta filas para sniffing (mais mensagens)
+    if (mode == CAN_MODE_SNIFF_ONLY || mode == CAN_MODE_HYBRID) {
+        general_config.tx_queue_len = 20;
+        general_config.rx_queue_len = 100;  // Maior para sniffing
+    } else {
+        general_config.tx_queue_len = 20;
+        general_config.rx_queue_len = 50;
+    }
+    
+    // Instala driver
+    esp_err_t ret = twai_driver_install(&general_config, &timing_config, &filter_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao instalar driver TWAI: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Inicia driver
+    ret = twai_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao iniciar driver TWAI: %s", esp_err_to_name(ret));
+        twai_driver_uninstall();
+        return ret;
+    }
+    
+    can_initialized = true;
+    current_mode = mode;
+    
+    ESP_LOGI(TAG, "✓ CAN reconfigurado com sucesso!");
+    return ESP_OK;
+}
+
+can_filter_mode_t obd_can_get_mode(void)
+{
+    return current_mode;
+}
+
+SemaphoreHandle_t obd_can_get_mutex(void)
+{
+    return can_mutex;
+}
+
+esp_err_t obd_can_receive_raw(twai_message_t *msg, uint32_t timeout_ms)
+{
+    if (!can_initialized || !msg) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    return twai_receive(msg, pdMS_TO_TICKS(timeout_ms));
 }

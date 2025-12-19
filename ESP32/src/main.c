@@ -23,6 +23,7 @@
 #include "obd_can.h"
 #include "obd_parser.h"
 #include "web_server.h"
+#include "can_sniffer.h"
 #include "esp_netif.h"
 #include <stdio.h>
 #include <sys/stat.h>
@@ -40,9 +41,15 @@ typedef enum {
     STATE_INIT,           // Inicializando
     STATE_IGNITION_OFF,   // Carro desligado
     STATE_IGNITION_ON,    // Carro ligado
-    STATE_LOGGING,        // Gravando dados
-    STATE_ERROR           // Erro crítico
+    STATE_LOGGING,        // Gravando dados OBD
+    STATE_ERROR,          // Erro crítico
+    // Sniffing states
+    STATE_SNIFF_ACTIVE,   // Sniffing CAN ativo
+    STATE_SNIFF_STORAGE_LOW, // Sniffing com storage baixo
+    STATE_HYBRID_MODE     // OBD + Sniffing simultâneo
 } system_state_t;
+
+#define NUM_STATES 8  // Total de estados para LED
 
 // Configurações de detecção
 #define IGNITION_RPM_THRESHOLD 300        // RPM > 300 = ignição ligada
@@ -62,6 +69,7 @@ static const obd_pid_t ESSENTIAL_PIDS[] = {
 
 // Estado global
 static system_state_t current_state = STATE_INIT;
+static system_state_t obd_state = STATE_INIT;  // Estado separado para OBD
 static telemetry_data_t snapshot = {0};
 static FILE *csv_file = NULL;
 static char current_session_file[64] = {0};
@@ -72,31 +80,105 @@ static uint64_t last_ignition_signal = 0;
 typedef struct {
     int on_ms;
     int off_ms;
+    int repeat;  // 0 = infinito, >0 = repetições antes de pausa
+    int pause_ms; // Pausa após repetições
 } led_pattern_t;
 
 static const led_pattern_t LED_PATTERNS[] = {
-    [STATE_INIT]         = {100, 100},  // Pisca rápido
-    [STATE_IGNITION_OFF] = {2000, 500}, // Pisca lento
-    [STATE_IGNITION_ON]  = {50, 1950},  // Pulso rápido
-    [STATE_LOGGING]      = {500, 500},  // Pisca médio (gravando)
-    [STATE_ERROR]        = {100, 100}   // Pisca rápido (erro)
+    [STATE_INIT]             = {100, 100, 0, 0},    // Pisca rápido
+    [STATE_IGNITION_OFF]     = {2000, 500, 0, 0},   // Pisca lento
+    [STATE_IGNITION_ON]      = {50, 1950, 0, 0},    // Pulso rápido
+    [STATE_LOGGING]          = {500, 500, 0, 0},    // Pisca médio (OBD)
+    [STATE_ERROR]            = {100, 100, 0, 0},    // Pisca rápido (erro)
+    // Sniffing patterns - distintos para identificar modo
+    [STATE_SNIFF_ACTIVE]     = {100, 100, 0, 0},    // Pisca rápido constante
+    [STATE_SNIFF_STORAGE_LOW]= {50, 50, 3, 500},    // 3 piscos rápidos + pausa (alerta!)
+    [STATE_HYBRID_MODE]      = {200, 200, 2, 800}   // 2 piscos + pausa (híbrido)
 };
 
 /**
  * @brief Controla LED baseado no estado
+ * Verifica estado a cada 50ms para resposta rápida a mudanças
  */
 static void led_task(void *arg) {
     gpio_reset_pin(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
     
+    system_state_t last_state = current_state;
+    uint32_t cycle_time = 0;
+    bool led_on = false;
+    int repeat_count = 0;
+    bool in_pause = false;
+    
     while (1) {
         led_pattern_t pattern = LED_PATTERNS[current_state];
         
-        gpio_set_level(LED_PIN, 1);
-        vTaskDelay(pdMS_TO_TICKS(pattern.on_ms));
+        // Detecta mudança de estado - reinicia ciclo
+        if (current_state != last_state) {
+            ESP_LOGI(TAG, "LED pattern changed (state %d -> %d)", last_state, current_state);
+            last_state = current_state;
+            cycle_time = 0;
+            repeat_count = 0;
+            in_pause = false;
+            gpio_set_level(LED_PIN, 0);
+            led_on = false;
+        }
         
-        gpio_set_level(LED_PIN, 0);
-        vTaskDelay(pdMS_TO_TICKS(pattern.off_ms));
+        // Padrões com repetições (sniffing)
+        if (pattern.repeat > 0) {
+            if (in_pause) {
+                // Está na pausa entre ciclos
+                if (cycle_time >= pattern.pause_ms) {
+                    cycle_time = 0;
+                    repeat_count = 0;
+                    in_pause = false;
+                }
+            } else {
+                // Executando as repetições
+                int blink_cycle = pattern.on_ms + pattern.off_ms;
+                int position_in_blink = cycle_time % blink_cycle;
+                
+                if (position_in_blink < pattern.on_ms) {
+                    if (!led_on) {
+                        gpio_set_level(LED_PIN, 1);
+                        led_on = true;
+                    }
+                } else {
+                    if (led_on) {
+                        gpio_set_level(LED_PIN, 0);
+                        led_on = false;
+                        repeat_count++;
+                    }
+                }
+                
+                // Completou todas as repetições?
+                if (repeat_count >= pattern.repeat) {
+                    in_pause = true;
+                    cycle_time = 0;
+                    gpio_set_level(LED_PIN, 0);
+                    led_on = false;
+                }
+            }
+        } else {
+            // Padrões simples
+            int blink_cycle = pattern.on_ms + pattern.off_ms;
+            int position_in_blink = cycle_time % blink_cycle;
+            
+            if (position_in_blink < pattern.on_ms) {
+                if (!led_on) {
+                    gpio_set_level(LED_PIN, 1);
+                    led_on = true;
+                }
+            } else {
+                if (led_on) {
+                    gpio_set_level(LED_PIN, 0);
+                    led_on = false;
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+        cycle_time += 50;
     }
 }
 
@@ -292,6 +374,24 @@ static void obd_task(void *arg) {
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 current_state = STATE_INIT;
                 break;
+            
+            // Estados de sniffing - tratados pela sniffer_task
+            case STATE_SNIFF_ACTIVE:
+            case STATE_SNIFF_STORAGE_LOW:
+            case STATE_HYBRID_MODE:
+                // Continua lendo PIDs em modo híbrido
+                if (obd_state == STATE_LOGGING) {
+                    save_record();
+                }
+                // NÃO atualiza obd_state aqui - preserva estado OBD anterior
+                break;
+        }
+        
+        // Salva estado OBD somente se NÃO for estado de sniffing
+        if (current_state != STATE_SNIFF_ACTIVE && 
+            current_state != STATE_SNIFF_STORAGE_LOW && 
+            current_state != STATE_HYBRID_MODE) {
+            obd_state = current_state;
         }
         
         cycle_count++;
@@ -301,7 +401,8 @@ static void obd_task(void *arg) {
         if (now - last_print > 10000) {
             last_print = now;
             
-            const char *state_names[] = {"INIT", "IGN_OFF", "IGN_ON", "LOGGING", "ERROR"};
+            const char *state_names[] = {"INIT", "IGN_OFF", "IGN_ON", "LOGGING", "ERROR",
+                                         "SNIFF", "SNIFF_LOW", "HYBRID"};
             
             ESP_LOGI(TAG, "[%lu] State:%s | RPM:%.0f Spd:%d Tmp:%d°C | Records:%lu | Heap:%luKB",
                      cycle_count,
@@ -318,6 +419,88 @@ static void obd_task(void *arg) {
         }
         
         vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz quando logando
+    }
+}
+
+/**
+ * @brief Task de sniffing CAN - roda em paralelo com OBD task
+ * Captura mensagens CAN brutas e salva em formato GVRET
+ */
+static void sniffer_task(void *arg) {
+    ESP_LOGI(TAG, "Sniffer task started (waiting for activation via web API)");
+    
+    twai_message_t rx_msg;
+    can_raw_message_t raw_msg;
+    uint32_t flush_counter = 0;
+    uint32_t msg_batch = 0;
+    
+    while (1) {
+        sniff_state_t sniff_state = can_sniffer_get_state();
+        
+        // Só processa se sniffer estiver ativo
+        if (sniff_state == SNIFF_STATE_ACTIVE || 
+            sniff_state == SNIFF_STATE_STORAGE_LOW) {
+            
+            // Atualiza LED state baseado no sniffer
+            if (obd_state == STATE_LOGGING) {
+                current_state = STATE_HYBRID_MODE;
+            } else if (sniff_state == SNIFF_STATE_STORAGE_LOW) {
+                current_state = STATE_SNIFF_STORAGE_LOW;
+            } else {
+                current_state = STATE_SNIFF_ACTIVE;
+            }
+            
+            // Processa até 10 mensagens por iteração
+            msg_batch = 0;
+            while (msg_batch < 10) {
+                // Timeout de 1ms - não bloqueia muito
+                esp_err_t ret = obd_can_receive_raw(&rx_msg, 1);
+                if (ret != ESP_OK) {
+                    break;  // Sem mais mensagens
+                }
+                
+                // Converte para formato raw
+                raw_msg.timestamp_us = esp_timer_get_time();
+                raw_msg.identifier = rx_msg.identifier;
+                raw_msg.dlc = rx_msg.data_length_code;
+                raw_msg.extended = rx_msg.extd;
+                raw_msg.is_tx = false;
+                raw_msg.bus = 0;
+                memcpy(raw_msg.data, rx_msg.data, 8);
+                
+                // Processa mensagem (adiciona ao buffer)
+                can_sniffer_process_message(&raw_msg);
+                msg_batch++;
+            }
+            
+            // Flush buffer periodicamente
+            flush_counter++;
+            if (flush_counter >= 50) {
+                flush_counter = 0;
+                can_sniffer_flush();
+                
+                // Verifica se storage ficou crítico
+                if (can_sniffer_get_state() == SNIFF_STATE_STORAGE_FULL) {
+                    ESP_LOGW(TAG, "Storage full - sniffer stopped automatically");
+                    current_state = obd_state;
+                }
+            }
+            
+            // IMPORTANTE: Delay obrigatório para alimentar watchdog
+            vTaskDelay(pdMS_TO_TICKS(10));
+            
+        } else {
+            // Sniffer não ativo - volta para estado OBD
+            if (current_state == STATE_SNIFF_ACTIVE || 
+                current_state == STATE_SNIFF_STORAGE_LOW ||
+                current_state == STATE_HYBRID_MODE) {
+                // Restaura estado baseado na ignição
+                current_state = obd_state;
+                ESP_LOGI(TAG, "Sniffer inactive - LED restored to OBD state");
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            flush_counter = 0;
+        }
     }
 }
 
@@ -391,11 +574,12 @@ void app_main(void) {
     // Configura logs
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set("CAN_SNIFF", ESP_LOG_INFO);
     
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║   Smart OBD2 Logger v1.0           ║");
-    ESP_LOGI(TAG, "║   Auto-start/stop by ignition      ║");
+    ESP_LOGI(TAG, "║   Smart OBD2 Logger v2.0           ║");
+    ESP_LOGI(TAG, "║   OBD + CAN Sniffer Hybrid Mode    ║");
     ESP_LOGI(TAG, "╚════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     
@@ -415,7 +599,15 @@ void app_main(void) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
-    ESP_LOGI(TAG, "✓ CAN ready");
+    ESP_LOGI(TAG, "✓ CAN ready (OBD mode)");
+
+    // Init CAN sniffer module
+    ESP_LOGI(TAG, "Initializing CAN Sniffer...");
+    if (can_sniffer_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Sniffer init failed - continuing without sniffer");
+    } else {
+        ESP_LOGI(TAG, "✓ Sniffer ready (activate via /api/sniff/start)");
+    }
 
     // Init WiFi (não-bloqueante)
     ESP_LOGI(TAG, "Initializing WiFi (background)...");
@@ -423,11 +615,21 @@ void app_main(void) {
     wifi_connect(WIFI_SSID, WIFI_PASSWORD);
 
     // Start tasks IMEDIATAMENTE (não espera WiFi!)
-    ESP_LOGI(TAG, "✓ System ready - Starting OBD task");
+    ESP_LOGI(TAG, "✓ System ready - Starting tasks");
     xTaskCreate(led_task, "LED", 2048, NULL, 5, NULL);
     xTaskCreate(obd_task, "OBD", 8192, NULL, 6, NULL);
+    xTaskCreate(sniffer_task, "SNIFF", 4096, NULL, 7, NULL);  // Alta prioridade para sniffing
 
     // Task separada para iniciar web server quando WiFi conectar
     xTaskCreate(wifi_web_task, "WIFI_WEB", 4096, NULL, 3, NULL);
 
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   LED Patterns:                    ║");
+    ESP_LOGI(TAG, "║   - Slow blink: Ignition OFF       ║");
+    ESP_LOGI(TAG, "║   - Medium blink: OBD Logging      ║");
+    ESP_LOGI(TAG, "║   - Fast blink: Sniffing Active    ║");
+    ESP_LOGI(TAG, "║   - 3 quick + pause: Storage Low   ║");
+    ESP_LOGI(TAG, "║   - 2 blinks + pause: Hybrid Mode  ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════╝");
 }

@@ -12,7 +12,7 @@
 #include "esp_timer.h"
 
 // === NETWORK CONFIGURATION ===
-#define WIFI_SSID           "AVIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
+#define WIFI_SSID           "VIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
 #define WIFI_PASSWORD       "Mara@2025"    // Configure your WiFi password
 #define WIFI_MAX_RETRY      5                       // Maximum WiFi connection retries
 #define WIFI_RETRY_DELAY    5000                    // Delay between retries (ms)
