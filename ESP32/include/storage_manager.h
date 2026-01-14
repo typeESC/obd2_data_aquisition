@@ -1,10 +1,15 @@
 /**
  * @file storage_manager.h
- * @brief Storage abstraction layer for SPIFFS/SD card
+ * @brief Storage abstraction layer for SD Card and SPIFFS
  * @date 2025
  * 
- * Provides a unified interface for storage operations that can be
- * switched between SPIFFS and SD card without changing application code.
+ * Provides a unified interface for storage operations with automatic fallback:
+ * - Primary: SD Card (SPI mode) - large capacity for long trips
+ * - Fallback: SPIFFS - limited but always available (~2MB)
+ * 
+ * Hardware v2.0:
+ * - SD Card: SPI mode on VSPI (GPIO 5/18/19/23)
+ * - Auto-detection: tries SD first, falls back to SPIFFS
  */
 
 #ifndef STORAGE_MANAGER_H
@@ -16,8 +21,9 @@
 
 // === STORAGE BACKEND TYPE ===
 typedef enum {
-    STORAGE_BACKEND_SPIFFS,     // Internal SPIFFS flash
-    STORAGE_BACKEND_SD_SPI,     // SD card via SPI
+    STORAGE_BACKEND_NONE = 0,   // No storage available
+    STORAGE_BACKEND_SPIFFS,     // Internal SPIFFS flash (~2MB)
+    STORAGE_BACKEND_SD_SPI,     // SD card via SPI (recommended for long trips)
     STORAGE_BACKEND_SD_SDMMC    // SD card via SDMMC (not on all ESP32 variants)
 } storage_backend_t;
 
@@ -30,6 +36,8 @@ typedef struct {
     uint32_t file_count;        // Number of files
     storage_backend_t backend;  // Current backend type
     bool mounted;               // Is storage mounted
+    bool sd_available;          // SD card detected
+    bool spiffs_available;      // SPIFFS mounted (fallback)
 } storage_stats_t;
 
 // === STORAGE THRESHOLDS ===
@@ -40,7 +48,17 @@ typedef struct {
 // === PUBLIC FUNCTIONS ===
 
 /**
- * @brief Initialize storage manager
+ * @brief Initialize storage manager with automatic backend selection
+ * 
+ * Tries SD card first (if enabled in obd_config.h), falls back to SPIFFS.
+ * This is the recommended initialization method for auto-detection.
+ * 
+ * @return ESP_OK on success, ESP_FAIL if no storage available
+ */
+esp_err_t storage_manager_init_auto(void);
+
+/**
+ * @brief Initialize storage manager with specific backend
  * @param backend Backend type to use
  * @return ESP_OK on success
  */
@@ -111,5 +129,23 @@ size_t storage_manager_get_free(void);
  * @return ESP_OK on success
  */
 esp_err_t storage_manager_format(void);
+
+/**
+ * @brief Check if SD card is the active backend
+ * @return true if SD card is mounted and active
+ */
+bool storage_manager_is_sd_active(void);
+
+/**
+ * @brief Check if SD card is available (even if not primary)
+ * @return true if SD card is mounted
+ */
+bool storage_manager_sd_available(void);
+
+/**
+ * @brief Get active storage backend type
+ * @return Current storage_backend_t
+ */
+storage_backend_t storage_manager_get_active_backend(void);
 
 #endif // STORAGE_MANAGER_H

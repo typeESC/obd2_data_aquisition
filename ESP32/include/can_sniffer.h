@@ -15,7 +15,7 @@
 #include "esp_err.h"
 
 // === SNIFFER CONFIGURATION ===
-#define SNIFF_BUFFER_SIZE       200         // Circular buffer capacity (messages)
+#define SNIFF_BUFFER_SIZE       50          // Circular buffer capacity (100→50 msgs, economiza ~2KB RAM)
 #define SNIFF_LOG_DIR           "/spiffs"   // Log directory
 #define SNIFF_FILE_PREFIX       "canlog_"   // Log file prefix
 #define SNIFF_STORAGE_LOW_THRESHOLD 10      // Percentage - trigger warning LED

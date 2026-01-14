@@ -5,10 +5,13 @@
  * 
  * Captures raw CAN messages and logs them in GVRET CSV format for 
  * SavvyCAN compatibility. Uses circular buffer for high-speed capture.
+ * 
+ * Now supports dynamic storage path (SD card or SPIFFS via storage_manager).
  */
 
 #include "can_sniffer.h"
 #include "obd_config.h"
+#include "storage_manager.h"
 #include "driver/twai.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -110,15 +113,16 @@ static void track_unique_id(uint32_t id) {
  * @brief Update storage statistics
  */
 static void update_storage_stats(void) {
-    size_t total = 0, used = 0;
-    esp_spiffs_info(NULL, &total, &used);
-    
-    sniffer_stats.storage_free = total - used;
-    sniffer_stats.storage_percent_used = (used * 100.0f) / total;
+    storage_stats_t stats;
+    if (storage_manager_get_stats(&stats) == ESP_OK) {
+        sniffer_stats.storage_free = stats.free_bytes;
+        sniffer_stats.storage_percent_used = stats.percent_used;
+    }
 }
 
 /**
  * @brief Create new log file with GVRET header
+ * Uses dynamic path from storage_manager (SD card or SPIFFS)
  */
 static esp_err_t create_log_file(void) {
     // Generate filename with timestamp
@@ -127,9 +131,15 @@ static esp_err_t create_log_file(void) {
     time(&now);
     localtime_r(&now, &timeinfo);
     
+    // Get base path from storage manager (could be /sdcard or /spiffs)
+    const char *storage_path = storage_manager_get_base_path();
+    if (!storage_path) {
+        storage_path = SNIFF_LOG_DIR;  // Fallback
+    }
+    
     snprintf(current_log_path, sizeof(current_log_path),
              "%s/%s%04d%02d%02d_%02d%02d%02d.csv",
-             SNIFF_LOG_DIR, SNIFF_FILE_PREFIX,
+             storage_path, SNIFF_FILE_PREFIX,
              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     
@@ -144,7 +154,8 @@ static esp_err_t create_log_file(void) {
     fflush(log_file);
     file_header_written = true;
     
-    ESP_LOGI(TAG, "Created log file: %s", current_log_path);
+    ESP_LOGI(TAG, "Created log file: %s (on %s)", current_log_path,
+             storage_manager_is_sd_active() ? "SD Card" : "SPIFFS");
     return ESP_OK;
 }
 

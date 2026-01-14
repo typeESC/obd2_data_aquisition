@@ -42,7 +42,41 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
             case WIFI_EVENT_STA_DISCONNECTED:
                 wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
-                ESP_LOGW(TAG, "WiFi disconnected (reason: %d)", disconnected->reason);
+                
+                // Log detalhado do motivo
+                const char *reason_str = "Unknown";
+                switch(disconnected->reason) {
+                    case WIFI_REASON_AUTH_EXPIRE: reason_str = "Auth expired"; break;
+                    case WIFI_REASON_AUTH_LEAVE: reason_str = "Auth leave"; break;
+                    case WIFI_REASON_ASSOC_EXPIRE: reason_str = "Assoc expired"; break;
+                    case WIFI_REASON_ASSOC_TOOMANY: reason_str = "Too many connections"; break;
+                    case WIFI_REASON_NOT_AUTHED: reason_str = "Not authenticated"; break;
+                    case WIFI_REASON_NOT_ASSOCED: reason_str = "Not associated"; break;
+                    case WIFI_REASON_ASSOC_LEAVE: reason_str = "Assoc leave"; break;
+                    case WIFI_REASON_ASSOC_NOT_AUTHED: reason_str = "Assoc not authed"; break;
+                    case WIFI_REASON_DISASSOC_PWRCAP_BAD: reason_str = "Bad power cap"; break;
+                    case WIFI_REASON_DISASSOC_SUPCHAN_BAD: reason_str = "Bad channel"; break;
+                    case WIFI_REASON_IE_INVALID: reason_str = "Invalid IE"; break;
+                    case WIFI_REASON_MIC_FAILURE: reason_str = "MIC failure"; break;
+                    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: reason_str = "4-way handshake timeout (check password)"; break;
+                    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT: reason_str = "Group key timeout"; break;
+                    case WIFI_REASON_IE_IN_4WAY_DIFFERS: reason_str = "IE differs in 4-way"; break;
+                    case WIFI_REASON_GROUP_CIPHER_INVALID: reason_str = "Invalid group cipher"; break;
+                    case WIFI_REASON_PAIRWISE_CIPHER_INVALID: reason_str = "Invalid pairwise cipher"; break;
+                    case WIFI_REASON_AKMP_INVALID: reason_str = "Invalid AKMP"; break;
+                    case WIFI_REASON_UNSUPP_RSN_IE_VERSION: reason_str = "Unsupported RSN version"; break;
+                    case WIFI_REASON_INVALID_RSN_IE_CAP: reason_str = "Invalid RSN cap"; break;
+                    case WIFI_REASON_802_1X_AUTH_FAILED: reason_str = "802.1X auth failed"; break;
+                    case WIFI_REASON_CIPHER_SUITE_REJECTED: reason_str = "Cipher suite rejected"; break;
+                    case WIFI_REASON_BEACON_TIMEOUT: reason_str = "Beacon timeout"; break;
+                    case WIFI_REASON_NO_AP_FOUND: reason_str = "AP not found"; break;
+                    case WIFI_REASON_AUTH_FAIL: reason_str = "Authentication failed (wrong password?)"; break;
+                    case WIFI_REASON_ASSOC_FAIL: reason_str = "Association failed"; break;
+                    case WIFI_REASON_HANDSHAKE_TIMEOUT: reason_str = "Handshake timeout"; break;
+                    case WIFI_REASON_CONNECTION_FAIL: reason_str = "Connection failed"; break;
+                }
+                
+                ESP_LOGW(TAG, "WiFi disconnected - Reason %d: %s", disconnected->reason, reason_str);
                 
                 wifi_status.status = WIFI_STATUS_DISCONNECTED;
                 wifi_status.total_disconnections++;
@@ -221,9 +255,19 @@ esp_err_t wifi_connect(const char *ssid, const char *password)
         strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
     }
 
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    // Aceita WPA, WPA2 e WPA3 - compatibilidade máxima
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
+    // Debug: mostra configuração (sem senha)
+    ESP_LOGI(TAG, "WiFi Config:");
+    ESP_LOGI(TAG, "  SSID: %s (len=%d)", wifi_config.sta.ssid, strlen((char*)wifi_config.sta.ssid));
+    ESP_LOGI(TAG, "  Password: %s (len=%d)", password ? "***" : "NONE", 
+             password ? strlen(password) : 0);
+    ESP_LOGI(TAG, "  Auth mode: WPA/WPA2/WPA3");
 
     ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     if (ret != ESP_OK) {

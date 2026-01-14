@@ -7,6 +7,7 @@
 #define WEB_SERVER_H
 
 #include "obd_config.h"
+#include "pid_scheduler.h"
 #include "esp_err.h"
 
 /**
@@ -34,5 +35,18 @@ void web_server_update_telemetry(const telemetry_data_t *data);
  * @param records_count Número de registros na sessão atual
  */
 void web_server_update_state(int state, uint32_t records_count);
+
+/**
+ * @brief Atualiza DTCs para exibição na web
+ * @param confirmed DTCs confirmados
+ * @param pending DTCs pendentes
+ */
+void web_server_update_dtcs(const dtc_data_t *confirmed, const dtc_data_t *pending);
+
+/**
+ * @brief Atualiza telemetria estendida para API JSON
+ * @param data Dados de telemetria estendida
+ */
+void web_server_update_ext_telemetry(const extended_telemetry_t *data);
 
 #endif // WEB_SERVER_H

@@ -1,13 +1,18 @@
 /**
- * OBD2 Smart Logger - Auto-start/stop baseado em ignição
+ * OBD2 Smart Logger v2.0 - Auto-start/stop baseado em ignição
+ * 
+ * Hardware v2.0:
+ * - CAN transceiver: SN65HVD230 (3.3V native - no level shifter!)
+ * - Storage: SD Card (SPI) with SPIFFS fallback
+ * - Auto-start OBD + Sniffer on ignition detection
  * 
  * Features:
  * - Detecta ignição automaticamente (RPM > 0 ou voltagem > 12.5V)
- * - Inicia logging quando carro liga
+ * - Inicia logging OBD + CAN sniffing quando carro liga (AUTO!)
  * - Para logging quando carro desliga
  * - LED de status (WiFi, Logging, Erro)
  * - Sessions separadas (cada ignição = arquivo novo)
- * - Preparado para MQTT
+ * - SD Card para longas viagens (fallback para SPIFFS)
  */
 
 #include "freertos/FreeRTOS.h"
@@ -24,6 +29,8 @@
 #include "obd_parser.h"
 #include "web_server.h"
 #include "can_sniffer.h"
+#include "pid_scheduler.h"
+#include "storage_manager.h"
 #include "esp_netif.h"
 #include <stdio.h>
 #include <sys/stat.h>
@@ -35,6 +42,7 @@
 
 #define TAG "SMART_LOGGER"
 #define LED_PIN GPIO_NUM_2
+#define BOOT_BUTTON_PIN GPIO_NUM_0  // Botão BOOT do ESP32
 
 // Estados do sistema
 typedef enum {
@@ -56,25 +64,25 @@ typedef enum {
 #define IGNITION_VOLTAGE_THRESHOLD 12.5f  // Voltagem > 12.5V = ignição ligada
 #define IGNITION_OFF_TIMEOUT 5000         // 5s sem sinais = desligou (era 30s)
 
-// PIDs essenciais
-static const obd_pid_t ESSENTIAL_PIDS[] = {
-    PID_RPM,
-    PID_SPEED,
-    PID_COOLANT_TEMP,
-    PID_ENGINE_LOAD,
-    PID_THROTTLE_POS,
-    PID_MAF_RATE
-};
-#define NUM_PIDS (sizeof(ESSENTIAL_PIDS)/sizeof(ESSENTIAL_PIDS[0]))
+// PIDs essenciais - DEPRECATED: Agora usa pid_scheduler
+// Removido LEGACY_PIDS pois não é mais utilizado
 
 // Estado global
 static system_state_t current_state = STATE_INIT;
 static system_state_t obd_state = STATE_INIT;  // Estado separado para OBD
 static telemetry_data_t snapshot = {0};
+static extended_telemetry_t ext_telemetry = {0};  // Telemetria estendida do scheduler
 static FILE *csv_file = NULL;
 static char current_session_file[64] = {0};
 static uint32_t records_in_session = 0;
 static uint64_t last_ignition_signal = 0;
+static bool sniffer_auto_started = false;  // Track if sniffer was auto-started
+
+// DTC (Diagnostic Trouble Codes) data
+static dtc_data_t confirmed_dtcs = {0};    // DTCs confirmados (MIL aceso)
+static dtc_data_t pending_dtcs = {0};      // DTCs pendentes (em monitoramento)
+static uint64_t last_dtc_check = 0;        // Última verificação de DTCs
+#define DTC_CHECK_INTERVAL_MS  30000       // Verificar DTCs a cada 30 segundos
 
 // Padrões de LED
 typedef struct {
@@ -183,25 +191,90 @@ static void led_task(void *arg) {
 }
 
 /**
- * @brief Inicializa SPIFFS
+ * @brief Task que monitora botão BOOT para controlar sniffer
+ * Pressionar BOOT: liga/desliga sniffer (modo híbrido se carro ligado)
+ */
+static void button_task(void *arg) {
+    // Configura GPIO0 (botão BOOT) como input com pull-up
+    gpio_config_t btn_config = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_config);
+    
+    bool last_button_state = true;  // Pull-up = HIGH quando não pressionado
+    uint32_t debounce_count = 0;
+    const uint32_t DEBOUNCE_THRESHOLD = 3;  // 150ms (50ms * 3)
+    
+    ESP_LOGI(TAG, "Button task started - Press BOOT to toggle sniffer");
+    
+    while (1) {
+        bool button_state = gpio_get_level(BOOT_BUTTON_PIN);
+        
+        // Detecta borda de descida (botão pressionado)
+        if (button_state == false && last_button_state == true) {
+            debounce_count++;
+            
+            if (debounce_count >= DEBOUNCE_THRESHOLD) {
+                // Botão pressionado confirmado
+                sniff_state_t sniff_state = can_sniffer_get_state();
+                
+                if (sniff_state == SNIFF_STATE_IDLE) {
+                    // Inicia sniffer
+                    sniff_filter_t filter = {
+                        .id_min = 0x000,
+                        .id_max = 0x7FF,
+                        .exclude_obd_requests = true
+                    };
+                    
+                    if (can_sniffer_start(&filter) == ESP_OK) {
+                        ESP_LOGI(TAG, "🔴 Sniffer started by BOOT button");
+                        if (obd_state == STATE_LOGGING) {
+                            ESP_LOGI(TAG, "   ⚡ HYBRID MODE active (OBD + Sniffing)");
+                        }
+                    }
+                } else {
+                    // Para sniffer
+                    can_sniffer_stop();
+                    ESP_LOGI(TAG, "⚫ Sniffer stopped by BOOT button");
+                }
+                
+                debounce_count = 0;
+                // Aguarda soltar o botão
+                while (gpio_get_level(BOOT_BUTTON_PIN) == false) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+            }
+        } else if (button_state == true) {
+            debounce_count = 0;
+        }
+        
+        last_button_state = button_state;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/**
+ * @brief Inicializa storage (SD Card com fallback para SPIFFS)
  */
 static esp_err_t init_storage() {
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path = "/spiffs",
-        .partition_label = NULL,
-        .max_files = 10,
-        .format_if_mount_failed = true
-    };
+    // Use auto-detection: SD card first, fallback to SPIFFS
+    esp_err_t ret = storage_manager_init_auto();
     
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Storage initialization failed!");
         return ret;
     }
     
-    size_t total = 0, used = 0;
-    esp_spiffs_info(NULL, &total, &used);
-    ESP_LOGI(TAG, "SPIFFS: %d KB total, %d KB used", total/1024, used/1024);
+    // Log storage type
+    if (storage_manager_is_sd_active()) {
+        ESP_LOGI(TAG, "📁 Storage: SD Card (large capacity for long trips)");
+    } else {
+        ESP_LOGW(TAG, "📁 Storage: SPIFFS (limited ~2MB - insert SD for long trips)");
+    }
     
     return ESP_OK;
 }
@@ -210,6 +283,13 @@ static esp_err_t init_storage() {
  * @brief Cria novo arquivo de sessão
  */
 static esp_err_t create_session_file() {
+    // Get base path from storage manager
+    const char *base_path = storage_manager_get_base_path();
+    if (!base_path) {
+        ESP_LOGE(TAG, "Storage not initialized");
+        return ESP_FAIL;
+    }
+    
     // Nome do arquivo: session_2024-12-18_14-30.csv
     time_t now;
     struct tm timeinfo;
@@ -217,7 +297,8 @@ static esp_err_t create_session_file() {
     localtime_r(&now, &timeinfo);
 
     snprintf(current_session_file, sizeof(current_session_file), 
-            "/spiffs/session_%04d-%02d-%02d_%02d-%02d.csv",
+            "%s/session_%04d-%02d-%02d_%02d-%02d.csv",
+            base_path,
             timeinfo.tm_year + 1900,
             timeinfo.tm_mon + 1,
             timeinfo.tm_mday,
@@ -226,16 +307,24 @@ static esp_err_t create_session_file() {
     
     csv_file = fopen(current_session_file, "w");
     if (!csv_file) {
-        ESP_LOGE(TAG, "Failed to create session file");
+        ESP_LOGE(TAG, "Failed to create session file: %s", current_session_file);
         return ESP_FAIL;
     }
     
-    // Header CSV
-    fprintf(csv_file, "timestamp,rpm,speed,coolant,load,throttle,maf\n");
+    // Header CSV estendido (timestamp em microssegundos para sincronização com CAN)
+    // Tier1: rpm, speed, throttle, load, maf
+    // Tier2: coolant, manifold, fuel_level, intake_temp, runtime
+    // Tier3: voltage, oil_temp, fuel_trim_short, fuel_trim_long, distance, ambient, timing
+    // Tier4: mil_status, dtc_count
+    fprintf(csv_file, "timestamp_us,rpm,speed,throttle,load,maf,"
+                      "coolant,manifold,fuel_level,intake_temp,runtime,"
+                      "voltage,oil_temp,fuel_trim_short,fuel_trim_long,distance,ambient,timing,"
+                      "mil_status,dtc_count,valid_mask\n");
     fflush(csv_file);
     
     records_in_session = 0;
-    ESP_LOGI(TAG, "Session file created: %s", current_session_file);
+    ESP_LOGI(TAG, "Session file created: %s (on %s)", current_session_file,
+             storage_manager_is_sd_active() ? "SD Card" : "SPIFFS");
     
     return ESP_OK;
 }
@@ -260,19 +349,147 @@ static void close_session_file() {
 }
 
 /**
- * @brief Salva registro no CSV
+ * @brief Salva DTCs encontrados em arquivo
+ */
+static void save_dtcs_to_file(const dtc_data_t* dtcs, bool confirmed) {
+    if (dtcs->count == 0) return;
+    
+    // Get base path from storage manager
+    const char *base_path = storage_manager_get_base_path();
+    if (!base_path) return;
+    
+    char dtc_path[80];
+    snprintf(dtc_path, sizeof(dtc_path), "%s/dtc_history.csv", base_path);
+    
+    // Arquivo de DTCs (append mode)
+    FILE* dtc_file = fopen(dtc_path, "a");
+    if (!dtc_file) {
+        // Primeira vez - cria com header
+        dtc_file = fopen(dtc_path, "w");
+        if (!dtc_file) {
+            ESP_LOGE(TAG, "Failed to create DTC history file");
+            return;
+        }
+        fprintf(dtc_file, "timestamp_us,type,code,system,description\n");
+    }
+    
+    uint64_t now = esp_timer_get_time();
+    const char* type_str = confirmed ? "CONFIRMED" : "PENDING";
+    
+    for (int i = 0; i < dtcs->count; i++) {
+        const dtc_code_t* dtc = &dtcs->codes[i];
+        const char* system_names[] = {"Powertrain", "Chassis", "Body", "Network"};
+        
+        fprintf(dtc_file, "%llu,%s,%s,%s,\n",
+                now,
+                type_str,
+                dtc->code_str,
+                system_names[dtc->system]);
+    }
+    
+    fflush(dtc_file);
+    fclose(dtc_file);
+    
+    ESP_LOGI(TAG, "Saved %d %s DTCs to history", dtcs->count, type_str);
+}
+
+/**
+ * @brief Lê e processa DTCs (confirmados e pendentes)
+ */
+static void check_and_log_dtcs(void) {
+    static uint8_t last_confirmed_count = 0;
+    static uint8_t last_pending_count = 0;
+    
+    // Lê DTCs confirmados (MIL ligado)
+    if (pid_scheduler_read_dtcs(&confirmed_dtcs, true) == ESP_OK) {
+        ext_telemetry.dtc_count = confirmed_dtcs.count;
+        
+        // Novo DTC detectado?
+        if (confirmed_dtcs.count > last_confirmed_count) {
+            ESP_LOGW(TAG, "⚠️  NEW CONFIRMED DTC DETECTED!");
+            for (int i = 0; i < confirmed_dtcs.count; i++) {
+                ESP_LOGW(TAG, "   🔴 %s (%s)", 
+                         confirmed_dtcs.codes[i].code_str,
+                         confirmed_dtcs.codes[i].system == DTC_SYSTEM_POWERTRAIN ? "Powertrain" :
+                         confirmed_dtcs.codes[i].system == DTC_SYSTEM_CHASSIS ? "Chassis" :
+                         confirmed_dtcs.codes[i].system == DTC_SYSTEM_BODY ? "Body" : "Network");
+            }
+            save_dtcs_to_file(&confirmed_dtcs, true);
+        }
+        last_confirmed_count = confirmed_dtcs.count;
+        
+        // Atualiza MIL status
+        confirmed_dtcs.mil_on = (confirmed_dtcs.count > 0);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));  // Pequeno delay entre requests
+    
+    // Lê DTCs pendentes (em monitoramento)
+    if (pid_scheduler_read_dtcs(&pending_dtcs, false) == ESP_OK) {
+        ext_telemetry.pending_dtc_count = pending_dtcs.count;
+        
+        // Novo DTC pendente?
+        if (pending_dtcs.count > last_pending_count) {
+            ESP_LOGI(TAG, "⚡ New pending DTC detected:");
+            for (int i = 0; i < pending_dtcs.count; i++) {
+                ESP_LOGI(TAG, "   🟡 %s", pending_dtcs.codes[i].code_str);
+            }
+            save_dtcs_to_file(&pending_dtcs, false);
+        }
+        last_pending_count = pending_dtcs.count;
+    }
+    
+    // Log resumo
+    if (confirmed_dtcs.count > 0 || pending_dtcs.count > 0) {
+        ESP_LOGI(TAG, "DTC Status: %d confirmed, %d pending, MIL: %s",
+                 confirmed_dtcs.count, pending_dtcs.count,
+                 confirmed_dtcs.mil_on ? "ON" : "OFF");
+    }
+    
+    // Atualiza web server com DTCs
+    web_server_update_dtcs(&confirmed_dtcs, &pending_dtcs);
+}
+
+/**
+ * @brief Salva registro no CSV (formato estendido)
  */
 static void save_record() {
     if (!csv_file) return;
     
-    fprintf(csv_file, "%llu,%.0f,%d,%d,%.1f,%.1f,%.2f\n",
-            snapshot.device_timestamp,
-            snapshot.rpm,
-            snapshot.speed,
-            snapshot.coolant_temp,
-            snapshot.engine_load,
-            snapshot.throttle_pos,
-            snapshot.maf_rate);
+    // Timestamp em microssegundos (sincronizado com CAN sniffer)
+    uint64_t timestamp_us = esp_timer_get_time();
+    ext_telemetry.timestamp_us = timestamp_us;
+    
+    // Formato estendido com todos os tiers
+    fprintf(csv_file, "%llu,%.0f,%d,%.1f,%.1f,%.2f,"     // Tier 1
+                      "%d,%d,%.1f,%d,%d,"                 // Tier 2
+                      "%.2f,%d,%.1f,%.1f,%d,%d,%.1f,"    // Tier 3
+                      "%d,%d,%lu\n",                      // Tier 4 + mask
+            timestamp_us,
+            // Tier 1 - Critical
+            ext_telemetry.rpm,
+            ext_telemetry.speed,
+            ext_telemetry.throttle_pos,
+            ext_telemetry.engine_load,
+            ext_telemetry.maf_rate,
+            // Tier 2 - High
+            ext_telemetry.coolant_temp,
+            ext_telemetry.manifold_pressure,
+            ext_telemetry.fuel_level,
+            ext_telemetry.intake_air_temp,
+            ext_telemetry.run_time,
+            // Tier 3 - Medium
+            ext_telemetry.control_voltage,
+            ext_telemetry.oil_temp,
+            ext_telemetry.fuel_trim_short_b1,
+            ext_telemetry.fuel_trim_long_b1,
+            ext_telemetry.distance_since_clear,
+            ext_telemetry.ambient_temp,
+            ext_telemetry.timing_advance,
+            // Tier 4 - Low
+            ext_telemetry.mil_status,
+            ext_telemetry.dtc_count,
+            ext_telemetry.valid_mask);
     
     records_in_session++;
     
@@ -280,6 +497,14 @@ static void save_record() {
     if (records_in_session % 10 == 0) {
         fflush(csv_file);
     }
+    
+    // Sync snapshot para compatibilidade com web_server
+    snapshot.rpm = ext_telemetry.rpm;
+    snapshot.speed = ext_telemetry.speed;
+    snapshot.coolant_temp = ext_telemetry.coolant_temp;
+    snapshot.engine_load = ext_telemetry.engine_load;
+    snapshot.throttle_pos = ext_telemetry.throttle_pos;
+    snapshot.maf_rate = ext_telemetry.maf_rate;
 }
 
 /**
@@ -306,36 +531,94 @@ static bool is_ignition_on() {
 }
 
 /**
- * @brief Task principal de aquisição OBD
+ * @brief Task principal de aquisição OBD com scheduler por tiers
+ * 
+ * Tiers de polling:
+ * - CRITICAL (100ms): RPM, Speed, Throttle, Load, MAF
+ * - HIGH (500ms): Coolant, Manifold, Fuel, Intake, Runtime
+ * - MEDIUM (2s): Voltage, Oil, Fuel Trim, Distance, Ambient, Timing
+ * - LOW (15s): MIL, DTCs, O2 sensors
  */
 static void obd_task(void *arg) {
-    ESP_LOGI(TAG, "OBD task started");
+    ESP_LOGI(TAG, "OBD task started with tier-based scheduler");
     
-    // Inicializa snapshot
+    // Inicializa scheduler e telemetria
+    pid_scheduler_init();
     obd_init_telemetry(&snapshot);
+    memset(&ext_telemetry, 0, sizeof(ext_telemetry));
     
-    uint8_t response[8];
-    size_t response_len;
     uint64_t last_print = 0;
+    uint64_t last_stats = 0;
     uint32_t cycle_count = 0;
+    
+    // Timestamps para cada tier
+    uint64_t last_tier_poll[POLL_TIER_COUNT] = {0};
     
     vTaskDelay(pdMS_TO_TICKS(2000)); // Aguarda estabilização
     
+    ESP_LOGI(TAG, "Starting tier-based polling:");
+    ESP_LOGI(TAG, "  CRITICAL: 5 PIDs @ 100ms");
+    ESP_LOGI(TAG, "  HIGH:     5 PIDs @ 500ms");
+    ESP_LOGI(TAG, "  MEDIUM:   7 PIDs @ 2000ms");
+    ESP_LOGI(TAG, "  LOW:      5 PIDs @ 15000ms");
+    
     while (1) {
-        snapshot.device_timestamp = esp_timer_get_time() / 1000;
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        snapshot.device_timestamp = now_ms;
         
-        // Lê PIDs essenciais
-        for (int i = 0; i < NUM_PIDS; i++) {
-            response_len = sizeof(response);
+        // ===== TIER-BASED POLLING =====
+        // Tier CRITICAL - Polls every 100ms (high priority)
+        if (now_ms - last_tier_poll[POLL_TIER_CRITICAL] >= TIER_CRITICAL_INTERVAL_MS) {
+            (void)pid_scheduler_poll_tier(POLL_TIER_CRITICAL, &ext_telemetry);
+            last_tier_poll[POLL_TIER_CRITICAL] = now_ms;
             
-            if (obd_can_request(ESSENTIAL_PIDS[i], response, &response_len) == ESP_OK) {
-                if (obd_parse_response(ESSENTIAL_PIDS[i], response, response_len, &snapshot)) {
-                    last_ignition_signal = esp_timer_get_time() / 1000;
+            // RPM/Speed para detecção de ignição
+            if (ext_telemetry.valid_mask & VALID_RPM) {
+                snapshot.rpm = ext_telemetry.rpm;
+                if (ext_telemetry.rpm > 0) {
+                    last_ignition_signal = now_ms;
                 }
+            }
+            if (ext_telemetry.valid_mask & VALID_SPEED) {
+                snapshot.speed = ext_telemetry.speed;
             }
         }
         
-        // Máquina de estados
+        // Tier HIGH - Polls every 500ms
+        if (now_ms - last_tier_poll[POLL_TIER_HIGH] >= TIER_HIGH_INTERVAL_MS) {
+            pid_scheduler_poll_tier(POLL_TIER_HIGH, &ext_telemetry);
+            last_tier_poll[POLL_TIER_HIGH] = now_ms;
+            
+            // Sync para snapshot
+            if (ext_telemetry.valid_mask & VALID_COOLANT) {
+                snapshot.coolant_temp = ext_telemetry.coolant_temp;
+            }
+        }
+        
+        // Tier MEDIUM - Polls every 2s
+        if (now_ms - last_tier_poll[POLL_TIER_MEDIUM] >= TIER_MEDIUM_INTERVAL_MS) {
+            pid_scheduler_poll_tier(POLL_TIER_MEDIUM, &ext_telemetry);
+            last_tier_poll[POLL_TIER_MEDIUM] = now_ms;
+            
+            // Voltagem para detecção de ignição
+            if (ext_telemetry.valid_mask & VALID_VOLTAGE) {
+                snapshot.module_voltage = ext_telemetry.control_voltage;
+            }
+        }
+        
+        // Tier LOW - Polls every 15s
+        if (now_ms - last_tier_poll[POLL_TIER_LOW] >= TIER_LOW_INTERVAL_MS) {
+            pid_scheduler_poll_tier(POLL_TIER_LOW, &ext_telemetry);
+            last_tier_poll[POLL_TIER_LOW] = now_ms;
+        }
+        
+        // ===== DTC CHECK - Every 30 seconds =====
+        if (now_ms - last_dtc_check >= DTC_CHECK_INTERVAL_MS) {
+            last_dtc_check = now_ms;
+            check_and_log_dtcs();
+        }
+        
+        // ===== MÁQUINA DE ESTADOS =====
         bool ignition = is_ignition_on();
         
         switch (current_state) {
@@ -348,9 +631,27 @@ static void obd_task(void *arg) {
                     ESP_LOGI(TAG, "🔑 Ignition ON detected");
                     current_state = STATE_IGNITION_ON;
                     
-                    // Cria novo arquivo de sessão
+                    // Cria novo arquivo de sessão OBD
                     if (create_session_file() == ESP_OK) {
                         current_state = STATE_LOGGING;
+                        
+                        // === AUTO-START SNIFFER (NEW!) ===
+                        #if AUTO_START_SNIFFER_ON_IGNITION
+                        sniff_filter_t auto_filter = {
+                            .id_min = 0x000,
+                            .id_max = 0x7FF,
+                            .exclude_obd_requests = SNIFFER_EXCLUDE_OBD_REQUESTS,
+                            .exclude_obd_responses = SNIFFER_EXCLUDE_OBD_RESPONSES
+                        };
+                        if (can_sniffer_start(&auto_filter) == ESP_OK) {
+                            ESP_LOGI(TAG, "🔴 CAN Sniffer AUTO-STARTED (hybrid mode)");
+                            ESP_LOGI(TAG, "   ⚡ Capturing ALL CAN traffic for reverse engineering");
+                            current_state = STATE_HYBRID_MODE;
+                            sniffer_auto_started = true;
+                        } else {
+                            ESP_LOGW(TAG, "Failed to auto-start sniffer");
+                        }
+                        #endif
                     } else {
                         current_state = STATE_ERROR;
                     }
@@ -359,12 +660,24 @@ static void obd_task(void *arg) {
                 
             case STATE_IGNITION_ON:
             case STATE_LOGGING:
+            case STATE_HYBRID_MODE:
                 if (!ignition) {
                     ESP_LOGI(TAG, "🔑 Ignition OFF detected");
+                    
+                    // Close OBD session file
                     close_session_file();
+                    
+                    // === AUTO-STOP SNIFFER (NEW!) ===
+                    if (sniffer_auto_started || can_sniffer_get_state() != SNIFF_STATE_IDLE) {
+                        can_sniffer_stop();
+                        ESP_LOGI(TAG, "⚫ CAN Sniffer AUTO-STOPPED");
+                        sniffer_auto_started = false;
+                    }
+                    
+                    pid_scheduler_log_stats();  // Log stats ao final da sessão
                     current_state = STATE_IGNITION_OFF;
                 } else {
-                    // Salva dados
+                    // Salva dados OBD
                     save_record();
                 }
                 break;
@@ -378,12 +691,12 @@ static void obd_task(void *arg) {
             // Estados de sniffing - tratados pela sniffer_task
             case STATE_SNIFF_ACTIVE:
             case STATE_SNIFF_STORAGE_LOW:
-            case STATE_HYBRID_MODE:
-                // Continua lendo PIDs em modo híbrido
-                if (obd_state == STATE_LOGGING) {
-                    save_record();
+                // Só sniffing (sem OBD logging) - raro, mas suportado
+                if (!ignition) {
+                    can_sniffer_stop();
+                    sniffer_auto_started = false;
+                    current_state = STATE_IGNITION_OFF;
                 }
-                // NÃO atualiza obd_state aqui - preserva estado OBD anterior
                 break;
         }
         
@@ -404,21 +717,37 @@ static void obd_task(void *arg) {
             const char *state_names[] = {"INIT", "IGN_OFF", "IGN_ON", "LOGGING", "ERROR",
                                          "SNIFF", "SNIFF_LOW", "HYBRID"};
             
-            ESP_LOGI(TAG, "[%lu] State:%s | RPM:%.0f Spd:%d Tmp:%d°C | Records:%lu | Heap:%luKB",
+            // Status principal com dados de todos os tiers
+            ESP_LOGI(TAG, "[%lu] State:%s | RPM:%.0f Spd:%d Tmp:%d°C Load:%.1f%% | Rec:%lu | Heap:%luKB",
                      cycle_count,
                      state_names[current_state],
-                     snapshot.rpm,
-                     snapshot.speed,
-                     snapshot.coolant_temp,
+                     ext_telemetry.rpm,
+                     ext_telemetry.speed,
+                     ext_telemetry.coolant_temp,
+                     ext_telemetry.engine_load,
                      records_in_session,
                      esp_get_free_heap_size() / 1024);
             
-            // Atualiza web server
+            // Dados adicionais dos tiers
+            ESP_LOGI(TAG, "       Throttle:%.1f%% MAF:%.2fg/s Fuel:%.1f%% Volt:%.2fV",
+                     ext_telemetry.throttle_pos,
+                     ext_telemetry.maf_rate,
+                     ext_telemetry.fuel_level,
+                     ext_telemetry.control_voltage);
+            
+            // Atualiza web server (usando snapshot para compatibilidade)
             web_server_update_telemetry(&snapshot);
+            web_server_update_ext_telemetry(&ext_telemetry);
             web_server_update_state(current_state, records_in_session);
         }
         
-        vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz quando logando
+        // Log estatísticas do scheduler a cada 60 segundos
+        if (now - last_stats > 60000) {
+            last_stats = now;
+            pid_scheduler_log_stats();
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz loop base
     }
 }
 
@@ -508,22 +837,29 @@ static void sniffer_task(void *arg) {
  * @brief Lista arquivos de sessão salvos
  */
 static void list_session_files() {
-    ESP_LOGI(TAG, "=== Session Files ===");
+    const char *base_path = storage_manager_get_base_path();
+    if (!base_path) {
+        ESP_LOGE(TAG, "Storage not initialized");
+        return;
+    }
     
-    DIR *dir = opendir("/spiffs");
+    ESP_LOGI(TAG, "=== Session Files (%s) ===", 
+             storage_manager_is_sd_active() ? "SD Card" : "SPIFFS");
+    
+    DIR *dir = opendir(base_path);
     if (!dir) {
-        ESP_LOGE(TAG, "Failed to open SPIFFS directory");
+        ESP_LOGE(TAG, "Failed to open directory: %s", base_path);
         return;
     }
     
     struct dirent *entry;
     struct stat st;
-    char filepath[320];  // Aumentado: 255 (NAME_MAX) + 64 (/spiffs/) + margem
+    char filepath[320];
     int file_count = 0;
     size_t total_size = 0;
     
     while ((entry = readdir(dir)) != NULL) {
-        snprintf(filepath, sizeof(filepath), "/spiffs/%s", entry->d_name);
+        snprintf(filepath, sizeof(filepath), "%s/%s", base_path, entry->d_name);
         
         if (stat(filepath, &st) == 0 && S_ISREG(st.st_mode)) {
             file_count++;
@@ -534,7 +870,15 @@ static void list_session_files() {
     
     closedir(dir);
     
-    ESP_LOGI(TAG, "Total: %d files, %.2f KB", file_count, total_size / 1024.0f);
+    // Get storage stats
+    storage_stats_t stats;
+    if (storage_manager_get_stats(&stats) == ESP_OK) {
+        ESP_LOGI(TAG, "Total: %d files, %.2f MB used, %.2f MB free (%.1f%% used)", 
+                 file_count, 
+                 stats.used_bytes / (1024.0f * 1024.0f),
+                 stats.free_bytes / (1024.0f * 1024.0f),
+                 stats.percent_used);
+    }
     ESP_LOGI(TAG, "====================");
 }
 
@@ -551,9 +895,9 @@ static void wifi_web_task(void *arg) {
         // Sincroniza hora via NTP
         setenv("TZ", "BRT+3", 1);
         tzset();
-        sntp_setoperatingmode(SNTP_OPMODE_POLL);
-        sntp_setservername(0, "pool.ntp.org");
-        sntp_init();
+        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_init();
         ESP_LOGI(TAG, "✓ NTP started");
         vTaskDelay(pdMS_TO_TICKS(2000));  // Aguarda 2s
         
@@ -575,16 +919,21 @@ void app_main(void) {
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("CAN_SNIFF", ESP_LOG_INFO);
+    esp_log_level_set("STORAGE", ESP_LOG_INFO);
     
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║   Smart OBD2 Logger v2.0           ║");
-    ESP_LOGI(TAG, "║   OBD + CAN Sniffer Hybrid Mode    ║");
-    ESP_LOGI(TAG, "╚════════════════════════════════════╝");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   Smart OBD2 Logger v2.0               ║");
+    ESP_LOGI(TAG, "║   Hardware: SN65HVD230 + SD Card       ║");
+    ESP_LOGI(TAG, "║   Auto OBD + Sniffer on Ignition       ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     
-    // Init
+    // Init NVS
     ESP_ERROR_CHECK(nvs_flash_init());
+    
+    // Init Storage (SD Card with SPIFFS fallback)
+    ESP_LOGI(TAG, "Initializing Storage...");
     ESP_ERROR_CHECK(init_storage());
     
     // Lista sessões anteriores
@@ -592,7 +941,8 @@ void app_main(void) {
 
     
     // Init CAN PRIMEIRO! (antes do WiFi)
-    ESP_LOGI(TAG, "Initializing CAN...");
+    ESP_LOGI(TAG, "Initializing CAN (SN65HVD230 transceiver)...");
+    ESP_LOGI(TAG, "  TX=GPIO%d, RX=GPIO%d", CAN_TX_PIN, CAN_RX_PIN);
     if (obd_can_init() != ESP_OK) {
         ESP_LOGE(TAG, "CAN init failed");
         current_state = STATE_ERROR;
@@ -606,7 +956,11 @@ void app_main(void) {
     if (can_sniffer_init() != ESP_OK) {
         ESP_LOGW(TAG, "Sniffer init failed - continuing without sniffer");
     } else {
-        ESP_LOGI(TAG, "✓ Sniffer ready (activate via /api/sniff/start)");
+        #if AUTO_START_SNIFFER_ON_IGNITION
+        ESP_LOGI(TAG, "✓ Sniffer ready (AUTO-START on ignition enabled)");
+        #else
+        ESP_LOGI(TAG, "✓ Sniffer ready (manual start via BOOT button or API)");
+        #endif
     }
 
     // Init WiFi (não-bloqueante)
@@ -617,19 +971,25 @@ void app_main(void) {
     // Start tasks IMEDIATAMENTE (não espera WiFi!)
     ESP_LOGI(TAG, "✓ System ready - Starting tasks");
     xTaskCreate(led_task, "LED", 2048, NULL, 5, NULL);
-    xTaskCreate(obd_task, "OBD", 8192, NULL, 6, NULL);
-    xTaskCreate(sniffer_task, "SNIFF", 4096, NULL, 7, NULL);  // Alta prioridade para sniffing
+    xTaskCreate(obd_task, "OBD", 12288, NULL, 6, NULL);
+    xTaskCreate(sniffer_task, "SNIFF", 8192, NULL, 7, NULL);
+    xTaskCreate(button_task, "BUTTON", 2048, NULL, 4, NULL);
 
     // Task separada para iniciar web server quando WiFi conectar
-    xTaskCreate(wifi_web_task, "WIFI_WEB", 4096, NULL, 3, NULL);
+    xTaskCreate(wifi_web_task, "WIFI_WEB", 6144, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║   LED Patterns:                    ║");
-    ESP_LOGI(TAG, "║   - Slow blink: Ignition OFF       ║");
-    ESP_LOGI(TAG, "║   - Medium blink: OBD Logging      ║");
-    ESP_LOGI(TAG, "║   - Fast blink: Sniffing Active    ║");
-    ESP_LOGI(TAG, "║   - 3 quick + pause: Storage Low   ║");
-    ESP_LOGI(TAG, "║   - 2 blinks + pause: Hybrid Mode  ║");
-    ESP_LOGI(TAG, "╚════════════════════════════════════╝");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   LED Patterns:                        ║");
+    ESP_LOGI(TAG, "║   - Slow blink: Ignition OFF           ║");
+    ESP_LOGI(TAG, "║   - Medium blink: OBD Logging only     ║");
+    ESP_LOGI(TAG, "║   - 2 blinks + pause: HYBRID MODE      ║");
+    ESP_LOGI(TAG, "║     (OBD + CAN Sniffing active)        ║");
+    ESP_LOGI(TAG, "║   - 3 quick + pause: Storage Low       ║");
+    ESP_LOGI(TAG, "║                                        ║");
+    ESP_LOGI(TAG, "║   🔴 BOOT button: toggle sniffer       ║");
+    ESP_LOGI(TAG, "║   📁 Storage: %s            ║", 
+             storage_manager_is_sd_active() ? "SD Card   " : "SPIFFS    ");
+    ESP_LOGI(TAG, "║   🚗 Auto-start: OBD + Sniffer         ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════╝");
 }

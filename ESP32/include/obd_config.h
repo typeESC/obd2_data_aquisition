@@ -2,6 +2,11 @@
  * @file obd_config.h
  * @brief Configuration header for OBD Data Logger with API integration
  * @date 2025
+ * 
+ * Hardware v2.0:
+ * - CAN transceiver: SN65HVD230 (3.3V native - no level shifter needed!)
+ * - Storage: SD Card (SPI mode) with SPIFFS fallback
+ * - Auto-start OBD + Sniffer on ignition detection
  */
 
 #ifndef OBD_CONFIG_H
@@ -10,6 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_timer.h"
+#include "driver/gpio.h"
 
 // === NETWORK CONFIGURATION ===
 #define WIFI_SSID           "VIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
@@ -31,13 +37,40 @@
 #define FALLBACK_ENABLED    true                    // Enable local storage fallback
 
 // === OBD CONFIGURATION ===
-#define CAN_RX_PIN          GPIO_NUM_27             // CAN RX pin
-#define CAN_TX_PIN          GPIO_NUM_25             // CAN TX pin
+// CAN Transceiver: SN65HVD230 (3.3V native - connects directly to ESP32)
+#define CAN_RX_PIN          GPIO_NUM_27             // CAN RX pin (from SN65HVD230 RXD)
+#define CAN_TX_PIN          GPIO_NUM_25             // CAN TX pin (to SN65HVD230 TXD)
 #define OBD_QUERY_DELAY_MS  50                      // MUDE: 100 → 50
 #define OBD_SCAN_INTERVAL   500                     // OK (mantém)
 #define OBD_RESPONSE_TIMEOUT 10                     // MUDE: 500 → 20 (CRÍTICO!)
 #define OBD_MAX_WAIT_TIME   40                     // ADICIONE esta linha
 #define OBD_STRICT_VALIDATION false                 // OK (mantém)
+
+// === SD CARD CONFIGURATION (SPI Mode) ===
+// For ESP32-DOIT-DevKit-V1 using VSPI
+#define SD_ENABLED          true                    // Enable SD card support
+#define SD_CS_PIN           GPIO_NUM_5              // SD Chip Select (SS)
+#define SD_MOSI_PIN         GPIO_NUM_23             // SPI MOSI (DI on SD)
+#define SD_MISO_PIN         GPIO_NUM_19             // SPI MISO (DO on SD)
+#define SD_SCK_PIN          GPIO_NUM_18             // SPI Clock (CLK on SD)
+#define SD_MOUNT_POINT      "/sdcard"               // Mount point for SD card
+#define SD_MAX_FILES        10                      // Maximum open files on SD
+#define SD_FORMAT_IF_FAIL   false                   // Don't format SD on mount fail (data loss!)
+
+// === STORAGE CONFIGURATION ===
+typedef enum {
+    STORAGE_BACKEND_NONE = 0,
+    STORAGE_BACKEND_SPIFFS,
+    STORAGE_BACKEND_SD_SPI
+} storage_backend_t;
+
+#define STORAGE_PREFER_SD       true                // Try SD first, fallback to SPIFFS
+#define SPIFFS_MOUNT_POINT      "/spiffs"           // SPIFFS mount point (fallback)
+
+// === AUTO-START CONFIGURATION ===
+#define AUTO_START_SNIFFER_ON_IGNITION  true        // Auto-start CAN sniffer with OBD logging
+#define SNIFFER_EXCLUDE_OBD_REQUESTS    true        // Filter out 0x7DF from sniffer
+#define SNIFFER_EXCLUDE_OBD_RESPONSES   false       // Keep ECU responses for correlation
 
 // === MULTI-RATE TASK CONFIGURATION ===
 #define CRITICAL_TASK_DELAY_MS 50           // 50ms = 20 Hz
@@ -55,10 +88,14 @@
 #define WATCHDOG_TIMEOUT    30000                   // Watchdog timeout (ms)
 
 // === PERFORMANCE TUNING ===
-#define HTTP_BUFFER_SIZE    4096                    // HTTP buffer size
-#define JSON_BUFFER_SIZE    12288                    // JSON buffer size
+#define HTTP_BUFFER_SIZE    2048                    // HTTP buffer size (3K→2K)
+#define JSON_BUFFER_SIZE    6144                    // JSON buffer size (8K→6K)
 #define SPIFFS_MAX_FILES    5                       // Maximum SPIFFS files
-#define HEAP_MIN_FREE       50000                   // Minimum free heap (bytes)
+#define HEAP_MIN_FREE       40000                   // Minimum free heap (bytes)
+
+// === BATCH CONFIGURATION (reduced for memory) ===
+#undef BATCH_SIZE
+#define BATCH_SIZE          5                       // Reduced from 10 to 5
 
 // === OBD PID DEFINITIONS ===
 typedef enum {
