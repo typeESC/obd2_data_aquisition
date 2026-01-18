@@ -1,9 +1,13 @@
 /**
- * OBD2 Smart Logger v2.0 - Auto-start/stop baseado em ignição
+ * OBD2 Smart Logger v3.0 - LilyGO T-SIM7670G S3 V1.1
  * 
- * Hardware v2.0:
+ * Hardware v3.0:
+ * - MCU: ESP32-S3-WROOM-1 (16MB Flash, 8MB PSRAM OPI)
+ * - Modem: SIM7670G 4G LTE + GPS (integrated)
  * - CAN transceiver: SN65HVD230 (3.3V native - no level shifter!)
  * - Storage: SD Card (SPI) with SPIFFS fallback
+ * - Display: OLED SSD1306 0.91" 128x32 (I2C)
+ * - IMU: MPU-6050 Accelerometer/Gyroscope (I2C)
  * - Auto-start OBD + Sniffer on ignition detection
  * 
  * Features:
@@ -13,17 +17,21 @@
  * - LED de status (WiFi, Logging, Erro)
  * - Sessions separadas (cada ignição = arquivo novo)
  * - SD Card para longas viagens (fallback para SPIFFS)
+ * - OLED display com páginas de dados
+ * - IMU para detecção de impacto/movimento
  */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/twai.h"
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "esp_timer.h"
 #include "esp_spiffs.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "obd_config.h"
+#include "board_config.h"
 #include "wifi_manager.h"
 #include "obd_can.h"
 #include "obd_parser.h"
@@ -31,6 +39,8 @@
 #include "can_sniffer.h"
 #include "pid_scheduler.h"
 #include "storage_manager.h"
+#include "mpu6050.h"
+#include "oled_display.h"
 #include "esp_netif.h"
 #include <stdio.h>
 #include <sys/stat.h>
@@ -41,7 +51,7 @@
 #include <sys/time.h>
 
 #define TAG "SMART_LOGGER"
-#define LED_PIN GPIO_NUM_2
+#define LED_PIN BOARD_LED_PIN  // GPIO12 on T-SIM7670G S3
 #define BOOT_BUTTON_PIN GPIO_NUM_0  // Botão BOOT do ESP32
 
 // Estados do sistema
@@ -77,6 +87,14 @@ static char current_session_file[64] = {0};
 static uint32_t records_in_session = 0;
 static uint64_t last_ignition_signal = 0;
 static bool sniffer_auto_started = false;  // Track if sniffer was auto-started
+
+// IMU data (MPU-6050)
+static mpu6050_data_t imu_data = {0};
+static mpu6050_motion_t motion_state = {0};
+static bool imu_available = false;
+
+// OLED display
+static bool oled_available = false;
 
 // DTC (Diagnostic Trouble Codes) data
 static dtc_data_t confirmed_dtcs = {0};    // DTCs confirmados (MIL aceso)
@@ -448,6 +466,182 @@ static void check_and_log_dtcs(void) {
     
     // Atualiza web server com DTCs
     web_server_update_dtcs(&confirmed_dtcs, &pending_dtcs);
+}
+
+/**
+ * @brief Inicializa barramento I2C para OLED e MPU6050
+ */
+static esp_err_t init_i2c_bus(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_PIN,
+        .scl_io_num = I2C_SCL_PIN,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FREQ_HZ,
+    };
+    
+    esp_err_t ret = i2c_param_config(I2C_NUM_0, &conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C param config failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ret = i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "I2C driver install failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "I2C bus initialized (SDA=%d, SCL=%d, %dkHz)", 
+             I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQ_HZ / 1000);
+    return ESP_OK;
+}
+
+/**
+ * @brief Scan I2C bus and print all detected devices
+ */
+static void i2c_scan_bus(void) {
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+    uint8_t devices_found = 0;
+    
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        
+        esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(50));
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            devices_found++;
+            const char *device_name = "Unknown";
+            if (addr == 0x68) device_name = "MPU-6050 (AD0=LOW)";
+            else if (addr == 0x69) device_name = "MPU-6050 (AD0=HIGH)";
+            else if (addr == 0x3C) device_name = "SSD1306 OLED";
+            else if (addr == 0x3D) device_name = "SSD1306 OLED (alt)";
+            
+            ESP_LOGI(TAG, "  ✓ Found device at 0x%02X: %s", addr, device_name);
+        }
+    }
+    
+    if (devices_found == 0) {
+        ESP_LOGE(TAG, "  ✗ No I2C devices found! Check wiring:");
+        ESP_LOGE(TAG, "    - SDA should be connected to GPIO %d", I2C_SDA_PIN);
+        ESP_LOGE(TAG, "    - SCL should be connected to GPIO %d", I2C_SCL_PIN);
+        ESP_LOGE(TAG, "    - VCC should be 3.3V (NOT 5V for ESP32-S3!)");
+        ESP_LOGE(TAG, "    - GND must be shared between ESP32 and modules");
+    } else {
+        ESP_LOGI(TAG, "  Total: %d device(s) found on I2C bus", devices_found);
+    }
+}
+
+/**
+ * @brief Task de leitura do IMU (MPU-6050)
+ * Amostragem a 50Hz para detecção de movimento e impacto
+ */
+static void imu_task(void *arg) {
+    ESP_LOGI(TAG, "IMU task started");
+    
+    const int sample_interval_ms = 1000 / MPU6050_SAMPLE_RATE_HZ;
+    uint32_t impact_count = 0;
+    
+    while (1) {
+        if (!imu_available) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // Lê dados do IMU
+        if (mpu6050_read(&imu_data) == ESP_OK) {
+            // Detecta estado de movimento
+            if (mpu6050_get_motion(&motion_state) == ESP_OK) {
+                // Log impacto detectado
+                if (motion_state.impact_detected) {
+                    impact_count++;
+                    ESP_LOGW(TAG, "⚠️  IMPACT DETECTED #%lu! Mag: %.2fg", 
+                             impact_count, motion_state.impact_g);
+                    
+                    // TODO: Salvar evento de impacto em arquivo separado
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(sample_interval_ms));
+    }
+}
+
+/**
+ * @brief Task de atualização do display OLED
+ * Atualiza a cada 100ms (10Hz)
+ */
+static void display_task(void *arg) {
+    ESP_LOGI(TAG, "Display task started");
+    
+    uint32_t button_hold_count = 0;
+    
+    while (1) {
+        if (!oled_available) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // Atualiza dados no display
+        oled_obd_data_t obd_disp = {
+            .rpm = ext_telemetry.rpm,
+            .speed = ext_telemetry.speed,
+            .coolant_temp = ext_telemetry.coolant_temp,
+            .engine_load = ext_telemetry.engine_load,
+            .throttle = ext_telemetry.throttle_pos,
+            .fuel_level = ext_telemetry.fuel_level,
+            .voltage = ext_telemetry.control_voltage,
+            .maf = ext_telemetry.maf_rate,
+            .intake_temp = ext_telemetry.intake_air_temp
+        };
+        oled_update_obd_data(&obd_disp);
+        
+        // Atualiza dados IMU
+        if (imu_available) {
+            oled_imu_data_t imu_disp = {
+                .accel_x = imu_data.accel_x_g,
+                .accel_y = imu_data.accel_y_g,
+                .accel_z = imu_data.accel_z_g,
+                .gyro_x = imu_data.gyro_x_dps,
+                .gyro_y = imu_data.gyro_y_dps,
+                .gyro_z = imu_data.gyro_z_dps,
+                .tilt_angle = motion_state.tilt_angle,
+                .is_moving = motion_state.is_moving,
+                .impact_detected = motion_state.impact_detected
+            };
+            oled_update_imu_data(&imu_disp);
+        }
+        
+        // Atualiza status
+        oled_status_t status = {
+            .wifi_connected = wifi_is_connected(),
+            .can_active = (current_state == STATE_LOGGING || current_state == STATE_HYBRID_MODE),
+            .sd_card_present = storage_manager_is_sd_active(),
+            .logging_active = (current_state == STATE_LOGGING || current_state == STATE_HYBRID_MODE),
+            .session_records = records_in_session
+        };
+        oled_update_status(&status);
+        
+        // Renderiza página atual
+        oled_render();
+        
+        // Troca de página com click simples no BOOT (com debounce)
+        bool current_button = gpio_get_level(BOOT_BUTTON_PIN);
+        if (!current_button && button_hold_count == 0) {  // Borda de descida (pressionado)
+            oled_next_page();
+            ESP_LOGI(TAG, "Display: Page changed to %d", oled_get_page());
+            button_hold_count = 3;  // Debounce: ignora próximos 300ms
+        } else if (button_hold_count > 0) {
+            button_hold_count--;  // Decrementa contador de debounce
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(OLED_REFRESH_MS));
+    }
 }
 
 /**
@@ -920,13 +1114,17 @@ void app_main(void) {
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("CAN_SNIFF", ESP_LOG_INFO);
     esp_log_level_set("STORAGE", ESP_LOG_INFO);
+    esp_log_level_set("MPU6050", ESP_LOG_INFO);
+    esp_log_level_set("OLED", ESP_LOG_INFO);
     
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║   Smart OBD2 Logger v2.0               ║");
-    ESP_LOGI(TAG, "║   Hardware: SN65HVD230 + SD Card       ║");
-    ESP_LOGI(TAG, "║   Auto OBD + Sniffer on Ignition       ║");
-    ESP_LOGI(TAG, "╚════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   Smart OBD2 Logger v3.0                       ║");
+    ESP_LOGI(TAG, "║   Board: LilyGO T-SIM7670G S3 V1.1             ║");
+    ESP_LOGI(TAG, "║   MCU: ESP32-S3 (16MB Flash, 8MB PSRAM)        ║");
+    ESP_LOGI(TAG, "║   Hardware: CAN + SD + OLED + IMU              ║");
+    ESP_LOGI(TAG, "║   Auto OBD + Sniffer on Ignition               ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     
     // Init NVS
@@ -938,14 +1136,82 @@ void app_main(void) {
     
     // Lista sessões anteriores
     list_session_files();
-
     
-    // Init CAN PRIMEIRO! (antes do WiFi)
+    // Init I2C Bus (for OLED and MPU6050)
+    ESP_LOGI(TAG, "Initializing I2C Bus...");
+    if (init_i2c_bus() == ESP_OK) {
+        // Scan I2C bus to find connected devices
+        i2c_scan_bus();
+        
+        // Init MPU6050
+        ESP_LOGI(TAG, "Initializing MPU-6050 IMU...");
+        
+        // Try address 0x68 first, then 0x69
+        uint8_t mpu_addr = MPU6050_I2C_ADDR;  // Default 0x68
+        mpu6050_config_t imu_config = {
+            .i2c_addr = mpu_addr,
+            .accel_fs = MPU6050_ACCEL_FS_2G,
+            .gyro_fs = MPU6050_GYRO_FS_250,
+            .dlpf = MPU6050_DLPF_44HZ,
+            .sample_rate_div = (1000 / MPU6050_SAMPLE_RATE_HZ) - 1  // 50Hz
+        };
+        
+        if (mpu6050_init(&imu_config) == ESP_OK) {
+            ESP_LOGI(TAG, "✓ MPU-6050 initialized (addr: 0x%02X)", mpu_addr);
+            imu_available = true;
+            
+            // Calibra IMU (veículo deve estar parado!)
+            ESP_LOGI(TAG, "  Calibrating IMU (keep vehicle stationary)...");
+            mpu6050_calibrate(100);
+            ESP_LOGI(TAG, "  ✓ IMU calibrated");
+        } else {
+            // Try alternate address 0x69
+            ESP_LOGW(TAG, "  MPU-6050 not found at 0x68, trying 0x69...");
+            mpu_addr = 0x69;
+            imu_config.i2c_addr = mpu_addr;
+            
+            if (mpu6050_init(&imu_config) == ESP_OK) {
+                ESP_LOGI(TAG, "✓ MPU-6050 initialized (addr: 0x%02X)", mpu_addr);
+                imu_available = true;
+                
+                ESP_LOGI(TAG, "  Calibrating IMU (keep vehicle stationary)...");
+                mpu6050_calibrate(100);
+                ESP_LOGI(TAG, "  ✓ IMU calibrated");
+            } else {
+                ESP_LOGW(TAG, "✗ MPU-6050 not detected at 0x68 or 0x69 - IMU disabled");
+                ESP_LOGW(TAG, "  Check wiring: SDA=GPIO%d, SCL=GPIO%d", I2C_SDA_PIN, I2C_SCL_PIN);
+                imu_available = false;
+            }
+        }
+        
+        // Init OLED Display
+        ESP_LOGI(TAG, "Initializing OLED Display...");
+        if (oled_init() == ESP_OK) {
+            ESP_LOGI(TAG, "✓ OLED display initialized (128x32, addr: 0x%02X)", OLED_I2C_ADDR);
+            oled_available = true;
+            
+            // Show startup screen
+            oled_show_startup();
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        } else {
+            ESP_LOGW(TAG, "✗ OLED display not detected - display disabled");
+            oled_available = false;
+        }
+    } else {
+        ESP_LOGW(TAG, "✗ I2C init failed - OLED and IMU disabled");
+        imu_available = false;
+        oled_available = false;
+    }
+    
+    // Init CAN (before WiFi!)
     ESP_LOGI(TAG, "Initializing CAN (SN65HVD230 transceiver)...");
     ESP_LOGI(TAG, "  TX=GPIO%d, RX=GPIO%d", CAN_TX_PIN, CAN_RX_PIN);
     if (obd_can_init() != ESP_OK) {
         ESP_LOGE(TAG, "CAN init failed");
         current_state = STATE_ERROR;
+        if (oled_available) {
+            oled_show_error("CAN INIT FAILED");
+        }
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
@@ -974,22 +1240,35 @@ void app_main(void) {
     xTaskCreate(obd_task, "OBD", 12288, NULL, 6, NULL);
     xTaskCreate(sniffer_task, "SNIFF", 8192, NULL, 7, NULL);
     xTaskCreate(button_task, "BUTTON", 2048, NULL, 4, NULL);
+    
+    // IMU and Display tasks (if hardware available)
+    if (imu_available) {
+        xTaskCreate(imu_task, "IMU", 4096, NULL, 5, NULL);
+    }
+    if (oled_available) {
+        xTaskCreate(display_task, "DISPLAY", 4096, NULL, 3, NULL);
+    }
 
     // Task separada para iniciar web server quando WiFi conectar
     xTaskCreate(wifi_web_task, "WIFI_WEB", 6144, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "╔════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║   LED Patterns:                        ║");
-    ESP_LOGI(TAG, "║   - Slow blink: Ignition OFF           ║");
-    ESP_LOGI(TAG, "║   - Medium blink: OBD Logging only     ║");
-    ESP_LOGI(TAG, "║   - 2 blinks + pause: HYBRID MODE      ║");
-    ESP_LOGI(TAG, "║     (OBD + CAN Sniffing active)        ║");
-    ESP_LOGI(TAG, "║   - 3 quick + pause: Storage Low       ║");
-    ESP_LOGI(TAG, "║                                        ║");
-    ESP_LOGI(TAG, "║   🔴 BOOT button: toggle sniffer       ║");
-    ESP_LOGI(TAG, "║   📁 Storage: %s            ║", 
-             storage_manager_is_sd_active() ? "SD Card   " : "SPIFFS    ");
-    ESP_LOGI(TAG, "║   🚗 Auto-start: OBD + Sniffer         ║");
-    ESP_LOGI(TAG, "╚════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   LED Patterns (GPIO%d):                       ║", LED_PIN);
+    ESP_LOGI(TAG, "║   - Slow blink: Ignition OFF                   ║");
+    ESP_LOGI(TAG, "║   - Medium blink: OBD Logging only             ║");
+    ESP_LOGI(TAG, "║   - 2 blinks + pause: HYBRID MODE              ║");
+    ESP_LOGI(TAG, "║     (OBD + CAN Sniffing active)                ║");
+    ESP_LOGI(TAG, "║   - 3 quick + pause: Storage Low               ║");
+    ESP_LOGI(TAG, "║                                                ║");
+    ESP_LOGI(TAG, "║   🔴 BOOT button short: toggle sniffer         ║");
+    ESP_LOGI(TAG, "║   🔴 BOOT button long: change OLED page        ║");
+    ESP_LOGI(TAG, "║   📁 Storage: %-10s                       ║", 
+             storage_manager_is_sd_active() ? "SD Card" : "SPIFFS");
+    ESP_LOGI(TAG, "║   📺 Display: %-10s                       ║",
+             oled_available ? "OLED 128x32" : "Disabled");
+    ESP_LOGI(TAG, "║   📐 IMU: %-10s                           ║",
+             imu_available ? "MPU-6050" : "Disabled");
+    ESP_LOGI(TAG, "║   🚗 Auto-start: OBD + Sniffer                 ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════╝");
 }

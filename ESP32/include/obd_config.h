@@ -3,9 +3,13 @@
  * @brief Configuration header for OBD Data Logger with API integration
  * @date 2025
  * 
- * Hardware v2.0:
+ * Hardware v3.0 - LilyGO T-SIM7670G S3 V1.1:
+ * - MCU: ESP32-S3-WROOM-1 (16MB Flash, 8MB PSRAM)
+ * - Modem: SIM7670G 4G LTE + GPS
  * - CAN transceiver: SN65HVD230 (3.3V native - no level shifter needed!)
  * - Storage: SD Card (SPI mode) with SPIFFS fallback
+ * - Display: OLED SSD1306 0.91" 128x32 (I2C)
+ * - IMU: MPU-6050 Accelerometer/Gyroscope (I2C)
  * - Auto-start OBD + Sniffer on ignition detection
  */
 
@@ -16,10 +20,11 @@
 #include <stdbool.h>
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "board_config.h"  // Hardware pin definitions for T-SIM7670G S3
 
 // === NETWORK CONFIGURATION ===
-#define WIFI_SSID           "VIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
-#define WIFI_PASSWORD       "Mara@2025"    // Configure your WiFi password
+#define WIFI_SSID           "D08D_Fibra" //"VIVOFIBRA-WIFI6-AC40"        // Configure your WiFi SSID
+#define WIFI_PASSWORD       "4Dh2RqV5" //"Mara@2025"    // Configure your WiFi password
 #define WIFI_MAX_RETRY      5                       // Maximum WiFi connection retries
 #define WIFI_RETRY_DELAY    5000                    // Delay between retries (ms)
 
@@ -37,33 +42,25 @@
 #define FALLBACK_ENABLED    true                    // Enable local storage fallback
 
 // === OBD CONFIGURATION ===
-// CAN Transceiver: SN65HVD230 (3.3V native - connects directly to ESP32)
-#define CAN_RX_PIN          GPIO_NUM_27             // CAN RX pin (from SN65HVD230 RXD)
-#define CAN_TX_PIN          GPIO_NUM_25             // CAN TX pin (to SN65HVD230 TXD)
-#define OBD_QUERY_DELAY_MS  50                      // MUDE: 100 → 50
-#define OBD_SCAN_INTERVAL   500                     // OK (mantém)
-#define OBD_RESPONSE_TIMEOUT 10                     // MUDE: 500 → 20 (CRÍTICO!)
-#define OBD_MAX_WAIT_TIME   40                     // ADICIONE esta linha
-#define OBD_STRICT_VALIDATION false                 // OK (mantém)
+// CAN Transceiver: SN65HVD230 (3.3V native - connects directly to ESP32-S3)
+// Pin definitions are in board_config.h (CAN_TX_PIN, CAN_RX_PIN)
+#define OBD_QUERY_DELAY_MS  50                      // Query delay in ms
+#define OBD_SCAN_INTERVAL   500                     // Scan interval in ms
+#define OBD_RESPONSE_TIMEOUT 10                     // Response timeout (critical!)
+#define OBD_MAX_WAIT_TIME   40                      // Max wait time
+#define OBD_STRICT_VALIDATION false                 // Validation mode
 
 // === SD CARD CONFIGURATION (SPI Mode) ===
-// For ESP32-DOIT-DevKit-V1 using VSPI
+// For LilyGO T-SIM7670G S3 using board-reserved pins
+// Pin definitions are in board_config.h (SD_CS_PIN, SD_MOSI_PIN, SD_MISO_PIN, SD_CLK_PIN)
 #define SD_ENABLED          true                    // Enable SD card support
-#define SD_CS_PIN           GPIO_NUM_5              // SD Chip Select (SS)
-#define SD_MOSI_PIN         GPIO_NUM_23             // SPI MOSI (DI on SD)
-#define SD_MISO_PIN         GPIO_NUM_19             // SPI MISO (DO on SD)
-#define SD_SCK_PIN          GPIO_NUM_18             // SPI Clock (CLK on SD)
+#define SD_SCK_PIN          SD_CLK_PIN              // Alias for compatibility
 #define SD_MOUNT_POINT      "/sdcard"               // Mount point for SD card
 #define SD_MAX_FILES        10                      // Maximum open files on SD
 #define SD_FORMAT_IF_FAIL   false                   // Don't format SD on mount fail (data loss!)
 
 // === STORAGE CONFIGURATION ===
-typedef enum {
-    STORAGE_BACKEND_NONE = 0,
-    STORAGE_BACKEND_SPIFFS,
-    STORAGE_BACKEND_SD_SPI
-} storage_backend_t;
-
+// Note: storage_backend_t enum is defined in storage_manager.h
 #define STORAGE_PREFER_SD       true                // Try SD first, fallback to SPIFFS
 #define SPIFFS_MOUNT_POINT      "/spiffs"           // SPIFFS mount point (fallback)
 

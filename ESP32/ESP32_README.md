@@ -1,6 +1,6 @@
-# Smart ESP32 OBD-II Logger v2.0
+# Smart ESP32 OBD-II Logger v3.0
 
-A comprehensive ESP32-based OBD-II data logger with CAN bus sniffing capabilities, featuring automatic ignition detection, hybrid mode operation, web interface, and SPIFFS storage.
+A comprehensive ESP32-S3-based OBD-II data logger with CAN bus sniffing capabilities, featuring automatic ignition detection, hybrid mode operation, web interface, OLED display, IMU sensor, and SD card storage.
 
 ## Features
 
@@ -10,33 +10,132 @@ A comprehensive ESP32-based OBD-II data logger with CAN bus sniffing capabilitie
   - CAN Sniffer mode for reverse engineering
   - Hybrid mode (OBD + Sniffing simultaneously)
 - **Web Interface**: Real-time monitoring and control via HTTP server
-- **Local Storage**: SPIFFS-based CSV logging (SavvyCAN-compatible GVRET format)
-- **LED Status Indicators**: Visual feedback without display
+- **OLED Display**: Real-time OBD data, IMU status, system info (128x32 SSD1306)
+- **IMU Sensor**: Impact detection, tilt monitoring, movement tracking (MPU-6050)
+- **Local Storage**: SD Card (primary) with SPIFFS fallback
+- **4G LTE Ready**: SIM7670G modem for remote data upload
+- **GPS Ready**: Integrated GPS via SIM7670G
+- **LED Status Indicators**: Visual feedback
 - **WiFi Connectivity**: Web dashboard and future cloud integration
 - **Offline Operation**: Works without internet connection
 
 ## Hardware Requirements
 
-- **ESP32 DevKit V1** (ESP32-D0WD-V3)
-- **CAN Transceiver**: MCP2515 or SN65HVD230
+### Main Board
+- **LilyGO T-SIM7670G S3 V1.1**
+  - MCU: ESP32-S3-WROOM-1 (16MB Flash, 8MB PSRAM OPI)
+  - Modem: SIM7670G 4G LTE + GPS
+  - Battery: 18650 holder with charger
+  - Solar: 5-6V input support
+
+### External Modules
+- **CAN Transceiver**: SN65HVD230 (3.3V native - no level shifter!)
+- **SD Card Module**: Standard SPI module
+- **OLED Display**: SSD1306 0.91" 128x32 (I2C)
+- **IMU Sensor**: MPU-6050 (I2C)
 - **OBD-II Connector**: 16-pin male connector
-- **Power**: 12V from OBD port → 3.3V/5V for ESP32
-- **Optional**: External antenna for better WiFi range
+- **Power**: 12V from OBD port → 3.3V/5V regulator
 
 ## Pin Configuration
 
 ```
-ESP32 GPIO     Function              OBD-II Pin
--------------------------------------------------
-GPIO 25        CAN TX                Via Transceiver
-GPIO 27        CAN RX                Via Transceiver
-GPIO 2         Status LED            Internal LED
-GND            Ground                Pin 4, 5 (Ground)
-VIN            12V Power             Pin 16 (12V Battery)
+╔════════════════════════════════════════════════════════════════╗
+║  LilyGO T-SIM7670G S3 V1.1 - Pin Mapping                       ║
+╠════════════════════════════════════════════════════════════════╣
+║                                                                ║
+║  CAN BUS (SN65HVD230):                                         ║
+║    GPIO 6  → CAN TX (to SN65HVD230 TXD)                        ║
+║    GPIO 7  → CAN RX (from SN65HVD230 RXD)                      ║
+║                                                                ║
+║  I2C BUS (OLED + MPU6050):                                     ║
+║    GPIO 15 → SDA (shared bus)                                  ║
+║    GPIO 16 → SCL (shared bus)                                  ║
+║    OLED Address: 0x3C                                          ║
+║    MPU6050 Address: 0x68 (AD0 = GND)                           ║
+║                                                                ║
+║  SD CARD (SPI - Board Reserved Pins):                          ║
+║    GPIO 13 → CS (Chip Select)                                  ║
+║    GPIO 14 → MOSI (Data In)                                    ║
+║    GPIO 21 → CLK (Clock)                                       ║
+║    GPIO 47 → MISO (Data Out)                                   ║
+║                                                                ║
+║  STATUS LED:                                                   ║
+║    GPIO 12 → Board LED                                         ║
+║                                                                ║
+║  MODEM (Reserved - DO NOT USE):                                ║
+║    GPIO 3, 4, 5, 9, 10, 11, 12, 17, 18                         ║
+║                                                                ║
+║  OBD-II CONNECTOR:                                             ║
+║    Pin 4, 5  → Ground (GND)                                    ║
+║    Pin 6     → CAN High (CANH)                                 ║
+║    Pin 14    → CAN Low (CANL)                                  ║
+║    Pin 16    → 12V Battery Power                               ║
+║                                                                ║
+╚════════════════════════════════════════════════════════════════╝
+```
 
-CAN Bus:
-  Pin 6  → CANH (CAN High)
-  Pin 14 → CANL (CAN Low)
+## Wiring Diagram
+
+```
+                    LilyGO T-SIM7670G S3 V1.1
+                    ┌─────────────────────────┐
+                    │                         │
+    ┌───────────────┼── GPIO 6  (CAN TX)      │
+    │               │                         │
+    │  ┌────────────┼── GPIO 7  (CAN RX)      │
+    │  │            │                         │
+    │  │    ┌───────┼── GPIO 15 (I2C SDA)     │
+    │  │    │       │                         │
+    │  │    │  ┌────┼── GPIO 16 (I2C SCL)     │
+    │  │    │  │    │                         │
+    │  │    │  │    │   GPIO 13 (SD CS)  ─────┼─────┐
+    │  │    │  │    │   GPIO 14 (SD MOSI) ────┼─────┼──┐
+    │  │    │  │    │   GPIO 21 (SD CLK)  ────┼─────┼──┼──┐
+    │  │    │  │    │   GPIO 47 (SD MISO) ────┼─────┼──┼──┼──┐
+    │  │    │  │    │                         │     │  │  │  │
+    │  │    │  │    │   3.3V ─────────────────┼─────┼──┼──┼──┼──┐
+    │  │    │  │    │   GND  ─────────────────┼─────┼──┼──┼──┼──┼──┐
+    │  │    │  │    └─────────────────────────┘     │  │  │  │  │  │
+    │  │    │  │                                    │  │  │  │  │  │
+    │  │    │  │    ┌─────────────────────────┐     │  │  │  │  │  │
+    │  │    │  │    │       SD Card Module    │     │  │  │  │  │  │
+    │  │    │  │    │  CS ───────────────────────────┘  │  │  │  │  │
+    │  │    │  │    │  MOSI ────────────────────────────┘  │  │  │  │
+    │  │    │  │    │  CLK  ───────────────────────────────┘  │  │  │
+    │  │    │  │    │  MISO ──────────────────────────────────┘  │  │
+    │  │    │  │    │  VCC  ─────────────────────────────────────┘  │
+    │  │    │  │    │  GND  ────────────────────────────────────────┘
+    │  │    │  │    └─────────────────────────┘
+    │  │    │  │
+    │  │    │  │    ┌─────────────────────────┐
+    │  │    │  │    │     OLED SSD1306        │
+    │  │    └──┼────┤  SDA                    │
+    │  │       └────┤  SCL                    │
+    │  │            │  VCC ───── 3.3V         │
+    │  │            │  GND ───── GND          │
+    │  │            └─────────────────────────┘
+    │  │
+    │  │            ┌─────────────────────────┐
+    │  │            │      MPU-6050           │
+    │  │    ┌───────┤  SDA (same I2C bus)     │
+    │  │    │  ┌────┤  SCL (same I2C bus)     │
+    │  │    │  │    │  VCC ───── 3.3V         │
+    │  │    │  │    │  GND ───── GND          │
+    │  │    │  │    │  AD0 ───── GND (0x68)   │
+    │  │    │  │    │  INT ───── NC (optional)│
+    │  │    │  │    └─────────────────────────┘
+    │  │    │  │
+    │  │    │  │    ┌─────────────────────────┐
+    │  │    │  │    │     SN65HVD230          │
+    └──┼────┼──┼────┤  TXD                    │
+       └────┼──┼────┤  RXD                    │
+            │  │    │  VCC ───── 3.3V         │
+            │  │    │  GND ───── GND          │
+            │  │    │  CANH ──────────────────┼─── OBD Pin 6
+            │  │    │  CANL ──────────────────┼─── OBD Pin 14
+            │  │    └─────────────────────────┘
+            │  │
+            └──┴─── (I2C bus shared between OLED and MPU6050)
 ```
 
 ## Configuration
@@ -48,22 +147,30 @@ Edit `include/obd_config.h`:
 #define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
 ```
 
-### 2. CAN Bus Configuration (Already configured)
+### 2. CAN Bus Configuration (in board_config.h)
 ```c
-#define CAN_RX_PIN          GPIO_NUM_27
-#define CAN_TX_PIN          GPIO_NUM_25
+#define CAN_TX_PIN          GPIO_NUM_6
+#define CAN_RX_PIN          GPIO_NUM_7
 #define CAN_BITRATE         500000  // 500 kbps (standard OBD)
 ```
 
-### 3. Ignition Detection Thresholds
+### 3. I2C Configuration (in board_config.h)
+```c
+#define I2C_SDA_PIN         GPIO_NUM_15
+#define I2C_SCL_PIN         GPIO_NUM_16
+#define I2C_FREQ_HZ         400000  // 400 kHz (Fast Mode)
+```
+
+### 4. Ignition Detection Thresholds
 ```c
 #define IGNITION_RPM_THRESHOLD      300     // RPM > 300 = ON
 #define IGNITION_VOLTAGE_THRESHOLD  12.5f   // Volts > 12.5 = ON
 #define IGNITION_OFF_TIMEOUT        5000    // 5s timeout
 ```
 
-### 4. Storage Configuration
-- **SPIFFS Partition**: ~2MB for session logs
+### 5. Storage Configuration
+- **SD Card**: Primary storage (large capacity)
+- **SPIFFS Partition**: Fallback (~2MB)
 - **Auto-cleanup**: When storage reaches 80%
 - **File format**: 
   - OBD logs: `session_YYYY-MM-DD_HH-MM.csv`
@@ -72,10 +179,8 @@ Edit `include/obd_config.h`:
 ## Build Instructions
 
 ### Prerequisites
-- ESP-IDF v4.4 or later
-- FastAPI backend running (see backend documentation)
-**PlatformIO** or **ESP-IDF v5.5**
-- **Python 3.7+** (for analysis script)
+- **PlatformIO** or **ESP-IDF v5.5**
+- **Python 3.7+** (for analysis scripts)
 - **SavvyCAN** (optional, for CAN log analysis)
 
 ### Using PlatformIO (Recommended)
@@ -97,7 +202,6 @@ platformio run --target upload --target monitor
 ```bash
 # Set up environment
 . $HOME/esp/esp-idf/export.sh
-src/obd_can.c`, `include/obd_can.h`)
    - TWAI driver for CAN communication
    - Multi-mode operation (OBD/Sniff/Hybrid)
    - Thread-safe with mutex protection
